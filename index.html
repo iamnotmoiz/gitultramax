@@ -9,6 +9,10 @@
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
 
     <script>
+        // "?gitfast-preview-tab" = this tab only shows the preview (opened by the show-site button)
+        if (/[?&]gitfast-preview-tab\b/.test(location.search)) document.documentElement.classList.add('preview-tab');
+    </script>
+    <script>
         tailwind.config = {
             darkMode: 'class',
             theme: {
@@ -136,6 +140,11 @@
             transition: transform 0.15s;
         }
         .tree-chevron.open { transform: rotate(90deg); }
+
+        /* Preview-only tab */
+        .preview-tab body { background: #fff; }
+        .preview-tab body > * { display: none !important; }
+        .preview-tab body > #previewTabFrame { display: block !important; position: fixed; inset: 0; width: 100%; height: 100%; border: 0; }
 
         /* Draggable divider between code and preview */
         .split-handle {
@@ -553,7 +562,9 @@
             avif: 'image/avif', bmp: 'image/bmp', ico: 'image/x-icon', svg: 'image/svg+xml',
             woff: 'font/woff', woff2: 'font/woff2', ttf: 'font/ttf', otf: 'font/otf', eot: 'application/vnd.ms-fontobject',
             mp4: 'video/mp4', webm: 'video/webm', mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg',
-            json: 'application/json', pdf: 'application/pdf'
+            json: 'application/json', pdf: 'application/pdf', js: 'text/javascript', mjs: 'text/javascript', css: 'text/css',
+            html: 'text/html', htm: 'text/html', txt: 'text/plain', md: 'text/markdown', csv: 'text/csv', xml: 'application/xml',
+            wasm: 'application/wasm', webmanifest: 'application/manifest+json', mov: 'video/quicktime', glb: 'model/gltf-binary', gltf: 'model/gltf+json'
         };
 
         // Never worth trying to read as text
@@ -605,12 +616,16 @@
             user: null,
             repos: [],
             currentRepo: '',
-            previewActive: true,
-            previewBlobUrl: null
+            previewActive: true
         };
 
         // --- INIT ---
         window.onload = async () => {
+            if (document.documentElement.classList.contains('preview-tab')) {
+                runPreviewTab();
+                return;
+            }
+
             if ("Notification" in window) Notification.requestPermission();
 
             initSplitter();
@@ -772,6 +787,7 @@
             }));
 
             // Update UI
+            disposePreviewCache(state.files);
             state.files = files;
             state.importedZip = null;
             state.previewPath = null;
@@ -853,6 +869,7 @@
                 }
 
                 // Swap the workspace over to the uploaded project
+                disposePreviewCache(state.files);
                 state.files = files;
                 state.importedZip = zipFile.name;
                 state.previewPath = null;
@@ -1010,6 +1027,9 @@
 
             const value = $('mainEditor').value;
             file.content = file.crlf ? value.replace(/\n/g, '\r\n') : value;
+            if (file._url) { URL.revokeObjectURL(file._url); file._url = null; }
+            // Compiled code can hold the old address of an image/text file it imports
+            if (!MODULE_EXT.test(state.currentPath) && !/\.(json|css|html?)$/i.test(state.currentPath)) disposePreviewCache();
 
             clearTimeout(window.previewTimer);
             window.previewTimer = setTimeout(() => {
@@ -1037,141 +1057,821 @@
             if (state.previewPath && state.files.has(state.previewPath)) return state.previewPath;
             const pages = [...state.files.keys()].filter((p) => /\.html?$/i.test(p) && !state.files.get(p).binary);
             if (!pages.length) return null;
-            const score = (p) => (/(^|\/)index\.html?$/i.test(p) ? 0 : 100) + p.split('/').length;
+            const score = (p) => (/(^|\/)index\.html?$/i.test(p) ? 0 : 100)
+                + (/(^|\/)(dist|build|out|coverage|\.next|storybook-static)\//i.test(p) ? 50 : 0)
+                + p.split('/').length;
             return pages.sort((a, b) => score(a) - score(b) || sortNames(a, b))[0];
         }
 
-        // Maps a src/href found in the project to a file in the workspace (or null for external URLs)
-        function resolveRef(baseDir, ref) {
+        // ---------- preview engine ----------
+        // Runs multi-file projects in the browser: follows imports, compiles JSX / TypeScript,
+        // pulls npm packages from esm.sh and serves the project's own assets from memory.
+        const MODULE_EXT = /\.(mjs|cjs|js|jsx|mts|cts|ts|tsx)$/i;
+        const STYLE_EXT = /\.(css|scss|sass|less|styl)$/i;
+        const RESOLVE_EXT = ['.tsx', '.ts', '.jsx', '.js', '.mjs', '.cjs', '.mts', '.json'];
+        const EMPTY_MODULE = 'data:text/javascript,';
+        const NODE_BUILTINS = new Set(['fs', 'path', 'os', 'crypto', 'http', 'https', 'url', 'util', 'stream', 'child_process', 'events', 'buffer', 'zlib', 'net', 'tls', 'assert']);
+        const COMPILER_SOURCES = [
+            'https://cdn.jsdelivr.net/npm/typescript@6.0.3/lib/typescript.js',
+            'https://unpkg.com/typescript@6.0.3/lib/typescript.js',
+            'https://cdn.jsdelivr.net/npm/typescript@5.4.5/lib/typescript.js'
+        ];
+        const SERVER_FRAMEWORKS = [['next', 'Next.js'], ['nuxt', 'Nuxt'], ['@remix-run/react', 'Remix'], ['@sveltejs/kit', 'SvelteKit'], ['astro', 'Astro'], ['@angular/core', 'Angular']];
+
+        const moduleCache = new Map(); // path -> { content, sig, url, imports, notes }
+        let compilerLoading = null;
+        let previewRun = 0;
+
+        const dataModule = (code) => 'data:text/javascript;charset=utf-8,' + encodeURIComponent(code).replace(/'/g, '%27');
+        const escapeScript = (js) => js.replace(/<\/script/gi, '<\\/script');
+
+        function joinPath(dir, rel) {
+            const out = dir.split('/').filter(Boolean);
+            for (const part of rel.split('/')) {
+                if (!part || part === '.') continue;
+                if (part === '..') { if (!out.length) return null; out.pop(); }
+                else out.push(part);
+            }
+            return out.join('/');
+        }
+
+        const asDir = (path) => (path ? path.replace(/\/?$/, '/') : '');
+        const hasDir = (dir) => { for (const p of state.files.keys()) if (p.startsWith(dir)) return true; return false; };
+        const textOf = (path) => { const f = state.files.get(path); return f && !f.binary ? f.content : null; };
+
+        function readJsonFile(path) {
+            const text = textOf(path);
+            if (text === null) return null;
+            try { return JSON.parse(text); } catch (e) { return null; }
+        }
+
+        function loadScript(url) {
+            return new Promise((resolve, reject) => {
+                const s = document.createElement('script');
+                s.src = url;
+                s.onload = () => (window.ts ? resolve() : reject(new Error('compiler missing')));
+                s.onerror = () => { s.remove(); reject(new Error('load failed')); };
+                document.head.appendChild(s);
+            });
+        }
+
+        // The compiler is only downloaded the first time a project actually needs it
+        function loadCompiler() {
+            if (window.ts) return Promise.resolve();
+            if (!compilerLoading) {
+                compilerLoading = COMPILER_SOURCES
+                    .reduce((p, url) => p.catch(() => loadScript(url)), Promise.reject(new Error('start')))
+                    .catch(() => {
+                        compilerLoading = null;
+                        throw new Error("The preview compiler couldn't be downloaded. Check your connection, then press refresh.");
+                    });
+            }
+            return compilerLoading;
+        }
+
+        function disposePreviewCache(files) {
+            for (const rec of moduleCache.values()) URL.revokeObjectURL(rec.url);
+            moduleCache.clear();
+            if (files) for (const f of files.values()) if (f._url) { URL.revokeObjectURL(f._url); f._url = null; }
+        }
+
+        // A blob: address for any workspace file, so pages can load it like a normal URL
+        function assetUrl(path) {
+            const file = state.files.get(path);
+            if (!file._url) {
+                const mime = MIME_TYPES[extname(path)] || (file.binary ? 'application/octet-stream' : 'text/plain');
+                file._url = URL.createObjectURL(new Blob([file.binary ? base64ToBytes(file.content) : file.content], { type: mime }));
+            }
+            return file._url;
+        }
+
+        function makePreviewContext(entry) {
+            const siteRoot = dirname(entry);
+            let publicDir = null, projectDir = siteRoot;
+            if (/(^|\/)public\/$/.test(siteRoot)) { publicDir = siteRoot; projectDir = siteRoot.replace(/public\/$/, ''); }
+            else if (hasDir(siteRoot + 'public/')) publicDir = siteRoot + 'public/';
+
+            // siteRoot, then each parent folder up to the project root
+            const dirs = [];
+            const add = (d) => { if (!dirs.includes(d)) dirs.push(d); };
+            for (const start of [siteRoot, projectDir]) {
+                const parts = start.split('/').filter(Boolean);
+                for (let i = parts.length; i >= 0; i--) add(asDir(parts.slice(0, i).join('/')));
+            }
+            dirs.sort((a, b) => b.length - a.length);
+
+            const deps = {};
+            for (const dir of [...dirs].reverse()) {
+                const pkg = readJsonFile(dir + 'package.json');
+                if (pkg) Object.assign(deps, pkg.devDependencies, pkg.dependencies);
+            }
+
+            // Only variables that frameworks expose to the browser anyway
+            const env = { NODE_ENV: 'development', MODE: 'development', DEV: true, PROD: false, SSR: false, BASE_URL: '/', PUBLIC_URL: '' };
+            for (const dir of [...dirs].reverse()) for (const name of ['.env', '.env.development', '.env.local']) {
+                const text = textOf(dir + name);
+                if (text === null) continue;
+                for (const line of text.split(/\r?\n/)) {
+                    const m = /^\s*(?:export\s+)?((?:VITE_|REACT_APP_|PUBLIC_)\w+)\s*=\s*(.*?)\s*$/.exec(line);
+                    if (m) env[m[1]] = m[2].replace(/^(['"])(.*)\1$/, '$2');
+                }
+            }
+
+            return {
+                entry, siteRoot, projectDir, publicDir, dirs, deps, env,
+                aliases: [], baseDirs: [], tsOptions: null, sig: '',
+                importMap: {}, cssFiles: new Set(), externalCss: new Set(), notes: new Set(), tailwind: 0
+            };
+        }
+
+        // Needs the compiler: reads tsconfig / vite config for "@/..." style import shortcuts
+        function finishPreviewContext(ctx) {
+            let jsxImportSource, decorators = false;
+            const addAlias = (key, target, exact) => { if (target !== null) ctx.aliases.push({ prefix: key, exact, target }); };
+
+            for (const dir of ctx.dirs) for (const name of ['tsconfig.json', 'tsconfig.app.json', 'jsconfig.json']) {
+                const text = textOf(dir + name);
+                if (text === null) continue;
+                const opts = ((ts.parseConfigFileTextToJson(name, text).config || {}).compilerOptions) || {};
+                if (!jsxImportSource && opts.jsxImportSource) jsxImportSource = opts.jsxImportSource;
+                if (opts.experimentalDecorators) decorators = true;
+                const base = joinPath(dir, opts.baseUrl || '.');
+                if (base === null) continue;
+                if (opts.baseUrl) ctx.baseDirs.push(asDir(base));
+                for (const [key, targets] of Object.entries(opts.paths || {})) {
+                    const first = Array.isArray(targets) ? targets[0] : null;
+                    if (typeof first !== 'string') continue;
+                    const exact = !key.endsWith('*');
+                    const resolved = joinPath(asDir(base), first.replace(/\*$/, ''));
+                    addAlias(exact ? key : key.slice(0, -1), resolved === null ? null : (exact ? resolved : asDir(resolved)), exact);
+                }
+            }
+
+            for (const dir of ctx.dirs) for (const name of ['vite.config.ts', 'vite.config.js', 'vite.config.mts', 'vite.config.mjs']) {
+                const text = textOf(dir + name);
+                if (text === null) continue;
+                const found = [];
+                const literals = (args) => [...args.matchAll(/['"]([^'"]+)['"]/g)].map((m) => m[1]).join('/');
+                for (const m of text.matchAll(/['"]([@~#][\w@\/-]*)['"]\s*:\s*(?:path\.)?(?:resolve|join)\(([^)]*)\)/g)) found.push([m[1], literals(m[2])]);
+                for (const m of text.matchAll(/['"]([@~#][\w@\/-]*)['"]\s*:\s*fileURLToPath\(\s*new URL\(\s*['"]([^'"]+)['"]/g)) found.push([m[1], m[2]]);
+                for (const m of text.matchAll(/find:\s*['"]([^'"]+)['"]\s*,\s*replacement:\s*(?:path\.)?(?:resolve|join)\(([^)]*)\)/g)) found.push([m[1], literals(m[2])]);
+                for (const [key, rel] of found) {
+                    const target = joinPath(dir, rel);
+                    addAlias(key.replace(/\/$/, '') + '/', target === null ? null : asDir(target), false);
+                    addAlias(key.replace(/\/$/, ''), target, true);
+                }
+            }
+
+            if (!ctx.aliases.some((a) => a.prefix === '@/')) {
+                const src = [ctx.siteRoot + 'src/', ctx.projectDir + 'src/'].find(hasDir);
+                if (src) addAlias('@/', src, false);
+            }
+            ctx.aliases.sort((a, b) => b.prefix.length - a.prefix.length);
+
+            if (!jsxImportSource && !ctx.deps.react && ctx.deps.preact) jsxImportSource = 'preact';
+            ctx.tsOptions = {
+                target: ts.ScriptTarget.ESNext,
+                module: ts.ModuleKind.ESNext,
+                jsx: ts.JsxEmit.ReactJSX,
+                isolatedModules: true,
+                allowJs: true,
+                experimentalDecorators: decorators
+            };
+            if (jsxImportSource) ctx.tsOptions.jsxImportSource = jsxImportSource;
+            ctx.sig = JSON.stringify([ctx.siteRoot, ctx.deps, ctx.aliases, ctx.baseDirs, jsxImportSource || '']);
+        }
+
+        // src / href as written in the project -> workspace path (null for external or missing files)
+        function resolveSite(ref, fromDir, ctx) {
             if (!ref) return null;
             ref = ref.trim();
             if (!ref || /^(?:[a-z][a-z0-9+.-]*:|\/\/|#)/i.test(ref)) return null;
-            ref = ref.split('#')[0].split('?')[0].replace(/^%PUBLIC_URL%/, '');
+            ref = ref.split('#')[0].split('?')[0];
             try { ref = decodeURIComponent(ref); } catch (e) { /* keep as written */ }
+            const bases = ref.startsWith('/') ? [ctx.siteRoot, ctx.publicDir, ctx.projectDir, ''] : [fromDir, ctx.publicDir];
+            for (const base of bases) {
+                if (base === null || base === undefined) continue;
+                const path = joinPath(base, ref);
+                if (path && state.files.has(path)) return path;
+            }
+            return null;
+        }
 
-            const absolute = ref.startsWith('/');
-            const tryFrom = (dir) => {
-                const out = dir ? dir.split('/').filter(Boolean) : [];
-                for (const part of ref.split('/')) {
-                    if (!part || part === '.') continue;
-                    if (part === '..') { if (!out.length) return null; out.pop(); }
-                    else out.push(part);
+        function findModuleFile(path) {
+            if (path === null) return null;
+            if (state.files.has(path)) return path;
+            for (const ext of RESOLVE_EXT) if (state.files.has(path + ext)) return path + ext;
+            const js = /\.(mjs|js|jsx)$/.exec(path); // TypeScript projects often import "./x.js" for x.ts
+            if (js) {
+                const stem = path.slice(0, -js[0].length);
+                for (const ext of ['.ts', '.tsx', '.mts']) if (state.files.has(stem + ext)) return stem + ext;
+            }
+            for (const ext of RESOLVE_EXT) if (state.files.has(path + '/index' + ext)) return path + '/index' + ext;
+            return null;
+        }
+
+        function resolveImport(spec, fromDir, ctx) {
+            if (spec.startsWith('.')) return findModuleFile(joinPath(fromDir, spec));
+            if (spec.startsWith('/')) {
+                for (const base of [ctx.siteRoot, ctx.publicDir, '']) {
+                    if (base === null) continue;
+                    const hit = findModuleFile(joinPath(base, spec));
+                    if (hit) return hit;
                 }
-                const path = out.join('/');
-                return state.files.has(path) ? path : null;
-            };
-
-            // "/x.css" means the site root: the entry page's folder first, then the project root
-            return tryFrom(baseDir) || (absolute && baseDir ? tryFrom('') : null);
+                return null;
+            }
+            for (const a of ctx.aliases) {
+                if (a.exact ? spec !== a.prefix : !spec.startsWith(a.prefix)) continue;
+                const hit = findModuleFile(joinPath('', a.target + spec.slice(a.prefix.length)));
+                if (hit) return hit;
+            }
+            for (const base of ctx.baseDirs) {
+                const hit = findModuleFile(joinPath(base, spec));
+                if (hit) return hit;
+            }
+            return null;
         }
 
-        function toDataUri(path, file) {
-            const mime = MIME_TYPES[extname(path)] || (file.binary ? 'application/octet-stream' : 'text/plain');
-            return `data:${mime};base64,${file.binary ? file.content : textToBase64(file.content)}`;
+        function pinnedVersion(range) {
+            if (typeof range !== 'string' || /[:\/]/.test(range)) return '';
+            const full = /\d+\.\d+\.\d+(?:-[\w.]+)?/.exec(range);
+            if (full) return full[0];
+            const major = /\d+(?:\.\d+)?/.exec(range);
+            return major ? major[0] : '';
         }
 
-        function inlineCssUrls(css, baseDir) {
+        // "react-dom/client" -> an esm.sh address, with every package pinned to the project's React
+        function npmSpecifier(spec, ctx, rec) {
+            const m = /^(@[^\/]+\/[^\/]+|[^\/]+)(\/.*)?$/.exec(spec);
+            if (!m) return spec;
+            const name = m[1], sub = m[2] || '';
+            if (spec.startsWith('node:') || (NODE_BUILTINS.has(name) && !ctx.deps[name])) {
+                rec.notes.push(`"${spec}" only exists on a server, so the code using it won't work in preview.`);
+                return dataModule('export default {};');
+            }
+            const version = pinnedVersion(ctx.deps[name]);
+            const base = `https://esm.sh/${name}${version ? '@' + version : ''}${sub}`;
+            if (STYLE_EXT.test(sub)) {
+                if (/\.css$/i.test(sub)) rec.imports.push({ kind: 'extcss', url: base });
+                return EMPTY_MODULE;
+            }
+            const react = pinnedVersion(ctx.deps.react);
+            if (!react || name === 'react') return base;
+            const reactDom = pinnedVersion(ctx.deps['react-dom']) || react;
+            return `${base}?deps=${name === 'react-dom' ? `react@${react}` : `react@${react},react-dom@${reactDom}`}`;
+        }
+
+        // What an import should point at once the code runs in the browser
+        function mapSpecifier(spec, fromPath, ctx, rec) {
+            if (/^(?:https?:)?\/\//i.test(spec) || /^(?:data|blob):/i.test(spec)) return spec;
+            const q = spec.indexOf('?');
+            const bare = q < 0 ? spec : spec.slice(0, q);
+            const query = q < 0 ? '' : spec.slice(q + 1);
+            const path = resolveImport(bare, dirname(fromPath), ctx);
+
+            if (!path) {
+                if (/^[.\/]/.test(bare)) {
+                    rec.notes.push(`${fromPath} imports "${spec}", which isn't in the project.`);
+                    return dataModule(`throw new Error(${JSON.stringify(`Missing file: ${spec} (imported by ${fromPath})`)});`);
+                }
+                return npmSpecifier(bare, ctx, rec);
+            }
+
+            const file = state.files.get(path);
+            if (query === 'raw' && !file.binary) return dataModule(`export default ${JSON.stringify(file.content)};`);
+
+            if (STYLE_EXT.test(path)) {
+                if (!/\.css$/i.test(path)) {
+                    rec.notes.push(`${path} needs a Sass/Less build step, so its styles are missing in preview.`);
+                    return dataModule('export default {};');
+                }
+                if (query === 'inline') return dataModule(`export default ${JSON.stringify(file.content)};`);
+                rec.imports.push({ kind: 'css', path });
+                // CSS modules: class names are used as written (no scoping in preview)
+                return /\.module\.css$/i.test(path)
+                    ? dataModule('export default new Proxy({}, { get: (t, k) => (typeof k === "string" ? k : undefined) });')
+                    : EMPTY_MODULE;
+            }
+
+            if (/\.(vue|svelte|astro)$/i.test(path)) {
+                rec.notes.push(`${basename(path)}: .${extname(path)} components need the project's own build step and can't run in preview.`);
+                return dataModule('export default {};');
+            }
+
+            if (MODULE_EXT.test(path) || /\.json$/i.test(path)) {
+                rec.imports.push({ kind: 'mod', path });
+                return 'gf-fs/' + path;
+            }
+
+            // Images, fonts, media...: the import yields the file's address, like Vite and CRA do
+            const url = JSON.stringify(assetUrl(path));
+            if (/\.svg$/i.test(path) && ctx.deps.react) {
+                const reactUrl = JSON.stringify(npmSpecifier('react', ctx, rec));
+                const component = `(props) => createElement("img", Object.assign({ src: ${url}, alt: "" }, props))`;
+                return dataModule(`import { createElement } from ${reactUrl};\nexport const ReactComponent = ${component};\nexport default ${query === 'react' ? 'ReactComponent' : url};`);
+            }
+            return dataModule(`export default ${url};`);
+        }
+
+        function compileModule(path, ctx, inlineSource) {
+            const content = inlineSource !== undefined ? inlineSource : state.files.get(path).content;
+            const cached = moduleCache.get(path);
+            if (cached && cached.content === content && cached.sig === ctx.sig) return cached;
+            if (cached) URL.revokeObjectURL(cached.url);
+
+            const rec = { content, sig: ctx.sig, url: null, imports: [], notes: [] };
+            let code;
+
+            if (/\.json$/i.test(path)) {
+                code = `export default ${content.trim() || 'null'};`;
+            } else {
+                let source = content
+                    .replace(/\bimport\.meta\.env\b/g, 'globalThis.__gfEnv')
+                    .replace(/\bimport\.meta\.hot\b/g, 'undefined')
+                    .replace(/new URL\(\s*(['"`])([^'"`$]+)\1\s*,\s*import\.meta\.url\s*\)/g, (match, quote, ref) => {
+                        const hit = resolveSite(ref, dirname(path), ctx);
+                        return hit ? `new URL(${JSON.stringify(assetUrl(hit))})` : match;
+                    });
+
+                const out = ts.transpileModule(source, { fileName: path, compilerOptions: ctx.tsOptions, reportDiagnostics: true });
+                if (out.diagnostics && out.diagnostics.length) {
+                    const d = out.diagnostics[0];
+                    const line = d.file && typeof d.start === 'number' ? d.file.getLineAndCharacterOfPosition(d.start).line + 1 : 0;
+                    rec.notes.push(`${path}${line ? ':' + line : ''} — ${ts.flattenDiagnosticMessageText(d.messageText, ' ')}`);
+                }
+
+                // Point every import at something a browser can load
+                const js = out.outputText;
+                const edits = [];
+                for (const ref of ts.preProcessFile(js, true, true).importedFiles) {
+                    const start = js.indexOf(ref.fileName, ref.pos);
+                    if (start < 0 || start > ref.pos + 2) continue;
+                    if (/require\s*\(\s*['"`]?$/.test(js.slice(Math.max(0, start - 16), start))) continue;
+                    const quote = js[start - 1];
+                    const next = mapSpecifier(ref.fileName, path, ctx, rec).replace(/\\/g, '\\\\').split(quote).join('\\' + quote);
+                    edits.push([start, start + ref.fileName.length, next]);
+                }
+                code = js;
+                for (const [start, end, next] of edits.sort((a, b) => b[0] - a[0])) code = code.slice(0, start) + next + code.slice(end);
+            }
+
+            rec.url = URL.createObjectURL(new Blob([code, `\n//# sourceURL=gitfast-preview/${path}`], { type: 'text/javascript' }));
+            moduleCache.set(path, rec);
+            return rec;
+        }
+
+        // Compile a module and everything it imports, in import order
+        function walkModule(path, ctx, seen, inlineSource) {
+            if (seen.has(path)) return moduleCache.get(path);
+            seen.add(path);
+            const rec = compileModule(path, ctx, inlineSource);
+            ctx.importMap['gf-fs/' + path] = rec.url;
+            rec.notes.forEach((n) => ctx.notes.add(n));
+            for (const imp of rec.imports) {
+                if (imp.kind === 'mod') walkModule(imp.path, ctx, seen);
+                else if (imp.kind === 'css') ctx.cssFiles.add(imp.path);
+                else ctx.externalCss.add(imp.url);
+            }
+            return rec;
+        }
+
+        function inlineCssUrls(css, baseDir, ctx) {
             return css.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, (match, quote, ref) => {
-                const path = resolveRef(baseDir, ref);
-                return path ? `url("${toDataUri(path, state.files.get(path))}")` : match;
+                const path = resolveSite(ref, baseDir, ctx);
+                return path ? `url("${assetUrl(path)}")` : match;
             });
         }
 
-        const escapeScript = (js) => js.replace(/<\/script/gi, '<\\/script');
+        const TAILWIND_CSS = /@tailwind\s|@apply\s|@theme\b|@import\s+(?:url\()?['"]tailwindcss/;
 
-        // Builds one self-contained page: local stylesheets, scripts and images are pulled in from the workspace
-        function buildPreview() {
-            const entry = pickPreviewEntry();
-            if (!entry) {
-                return {
-                    entry: null,
-                    needsBuild: false,
-                    html: '<!DOCTYPE html><html><body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;font:14px system-ui,sans-serif;color:#64748b;text-align:center;padding:24px;box-sizing:border-box">This project has no HTML file to preview.</body></html>'
-                };
-            }
+        function processCss(path, ctx, stack = []) {
+            let css = state.files.get(path).content;
+            const dir = dirname(path);
+            const hoisted = [];
 
-            const dom = new DOMParser().parseFromString(state.files.get(entry).content, 'text/html');
-            const baseDir = dirname(entry);
-            const inlined = new Set();
-            let needsBuild = false;
-
-            const lookup = (ref) => {
-                const path = resolveRef(baseDir, ref);
-                return path ? { path, file: state.files.get(path) } : null;
-            };
-
-            dom.querySelectorAll('style').forEach((style) => {
-                style.textContent = inlineCssUrls(style.textContent, baseDir);
+            css = css.replace(/@import\s+(?:url\(\s*)?(['"])([^'"]+)\1\s*\)?[^;]*;/g, (match, quote, ref) => {
+                if (/^(?:https?:)?\/\//i.test(ref)) { hoisted.push(match); return ''; }
+                if (ref === 'tailwindcss' || ref.startsWith('tailwindcss/')) { ctx.tailwind = 4; hoisted.push(match); return ''; }
+                const local = resolveSite(ref, dir, ctx) || resolveSite('./' + ref, dir, ctx);
+                if (local && !state.files.get(local).binary) return stack.includes(local) ? '' : processCss(local, ctx, [...stack, path]);
+                if (!/^[.\/]/.test(ref) && /\.css$/i.test(ref)) {
+                    const m = /^(@[^\/]+\/[^\/]+|[^\/]+)(\/.*)$/.exec(ref);
+                    if (m) { const v = pinnedVersion(ctx.deps[m[1]]); ctx.externalCss.add(`https://esm.sh/${m[1]}${v ? '@' + v : ''}${m[2]}`); }
+                }
+                return '';
             });
 
-            dom.querySelectorAll('link[href]').forEach((link) => {
-                const hit = lookup(link.getAttribute('href'));
-                if (!hit) return;
-                const rel = (link.getAttribute('rel') || '').toLowerCase();
-                if (rel.includes('stylesheet') && !hit.file.binary) {
-                    const style = dom.createElement('style');
-                    if (link.getAttribute('media')) style.setAttribute('media', link.getAttribute('media'));
-                    style.textContent = inlineCssUrls(hit.file.content, dirname(hit.path));
-                    link.replaceWith(style);
-                    inlined.add(hit.path);
-                } else if (rel.includes('icon')) {
-                    link.setAttribute('href', toDataUri(hit.path, hit.file));
+            if (/@tailwind\s/.test(css) && !ctx.tailwind) ctx.tailwind = 3;
+            css = css.replace(/@(?:plugin|config|source)\s+[^;{]+;/g, ''); // not supported by the in-browser Tailwind
+            return hoisted.join('\n') + (hoisted.length ? '\n' : '') + inlineCssUrls(css, dir, ctx);
+        }
+
+        // Applies the project's tailwind.config (colours, fonts...) to the in-browser Tailwind; plugins are skipped
+        function tailwindConfigScript(ctx) {
+            if (!window.ts) return '';
+            for (const dir of ctx.dirs) for (const name of ['tailwind.config.ts', 'tailwind.config.js', 'tailwind.config.cjs', 'tailwind.config.mjs']) {
+                const text = textOf(dir + name);
+                if (text === null) continue;
+                const js = ts.transpileModule(text, {
+                    fileName: name,
+                    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, esModuleInterop: true, allowJs: true }
+                }).outputText;
+                return `(function () { try {
+                    var stub = new Proxy(function () {}, { get: function (t, k) { return k === Symbol.iterator ? function* () {} : k === Symbol.toPrimitive ? function () { return ''; } : stub; }, apply: function () { return stub; } });
+                    var fonts = { sans: ['ui-sans-serif', 'system-ui', 'sans-serif'], serif: ['ui-serif', 'Georgia', 'serif'], mono: ['ui-monospace', 'Menlo', 'monospace'] };
+                    var module = { exports: {} }, exports = module.exports;
+                    var require = function (n) { return n === 'tailwindcss/defaultTheme' ? { fontFamily: fonts } : n === 'tailwindcss/colors' ? ((window.tailwind && window.tailwind.colors) || stub) : stub; };
+                    ${js}
+                    var cfg = (module.exports && module.exports.default) || module.exports;
+                    if (cfg && typeof cfg === 'object' && window.tailwind) window.tailwind.config = Object.assign({}, cfg, { plugins: [], presets: [], content: undefined });
+                } catch (e) { console.warn('GitFast preview: tailwind config not applied', e); } })();`;
+            }
+            return '';
+        }
+
+        function messagePage(text) {
+            return `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;font:14px/1.6 system-ui,sans-serif;color:#64748b;text-align:center;padding:32px;box-sizing:border-box"><p style="max-width:420px;margin:0">${escapeHtml(text)}</p></body></html>`;
+        }
+
+        function noPageMessage() {
+            const deps = {};
+            for (const path of state.files.keys()) {
+                if (basename(path) !== 'package.json') continue;
+                const pkg = readJsonFile(path);
+                if (pkg) Object.assign(deps, pkg.devDependencies, pkg.dependencies);
+            }
+            const hit = SERVER_FRAMEWORKS.find(([dep]) => deps[dep]);
+            if (hit) return `This is a ${hit[1]} project. It has no index.html and needs its own build tools or server to render, so it can't run in this preview. All files will still deploy to GitHub.`;
+            return 'This project has no HTML file to preview.';
+        }
+
+        // Runs inside the preview page, before the app's own code. Serialised with toString(), never called here.
+        function previewShim(CFG) {
+            // Give routers a normal "/" address to match against
+            try { history.replaceState(null, '', '/'); } catch (e) { /* e.g. opened from file:// */ }
+            window.__gfEnv = CFG.env;
+            if (!window.process) window.process = { env: CFG.env };
+            if (!window.global) window.global = window;
+
+            var FAKE = 'http://gitfast.invalid';
+            function lookup(u) {
+                if (typeof u !== 'string' || !u || /^(data:|blob:|#|javascript:|mailto:|tel:|about:)/i.test(u)) return null;
+                var abs;
+                try { abs = new URL(u, FAKE + '/'); } catch (e) { return null; }
+                if (abs.origin !== FAKE && abs.origin !== location.origin) return null;
+                var rel = abs.pathname.replace(/^\/+/, '');
+                try { rel = decodeURIComponent(rel); } catch (e) { /* keep */ }
+                var has = function (map, key) { return Object.prototype.hasOwnProperty.call(map, key) ? map[key] : null; };
+                return { rel: rel, url: has(CFG.assets, rel), page: has(CFG.pages, rel) || has(CFG.pages, (rel ? rel.replace(/\/?$/, '/') : '') + 'index.html') };
+            }
+
+            // --- messages shown at the bottom of the preview ---
+            var box, said = {};
+            function say(text, kind) {
+                if (said[text]) return;
+                said[text] = true;
+                if (!box) {
+                    box = document.createElement('div');
+                    box.style.cssText = 'position:fixed;left:8px;right:8px;bottom:8px;z-index:2147483647;max-height:45%;overflow:auto;display:flex;flex-direction:column;gap:6px;font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;pointer-events:none';
+                }
+                if (!box.isConnected) (document.body || document.documentElement).appendChild(box);
+                if (box.childNodes.length >= 6) return;
+                var row = document.createElement('div');
+                row.style.cssText = 'pointer-events:auto;cursor:pointer;padding:8px 10px;border-radius:8px;color:#fff;white-space:pre-wrap;word-break:break-word;box-shadow:0 4px 16px rgba(0,0,0,.3);background:' + (kind === 'error' ? '#b91c1c' : '#1e3a5f');
+                row.textContent = text;
+                row.title = 'Click to dismiss';
+                row.onclick = function () { row.remove(); };
+                box.appendChild(row);
+            }
+            window.addEventListener('error', function (e) {
+                var t = e.target;
+                if (t && t !== window && t.tagName) {
+                    if (t.tagName !== 'SCRIPT' && t.tagName !== 'LINK') return;
+                    var src = t.src || t.href || '';
+                    say(src.indexOf('blob:') === 0 ? "Part of this app failed to load — one of its imports couldn't be fetched. The browser console names the file." : "Couldn't load " + src, 'error');
+                    return;
+                }
+                if (/ResizeObserver/.test(e.message || '')) return;
+                say(e.message || 'Script error', 'error');
+            }, true);
+            window.addEventListener('unhandledrejection', function (e) {
+                var r = e.reason;
+                say('Error: ' + (r && r.message ? r.message : r), 'error');
+            });
+            document.addEventListener('DOMContentLoaded', function () { CFG.notes.forEach(function (n) { say(n, 'note'); }); });
+
+            // --- serve the project's own files to fetch(), XHR and elements created by scripts ---
+            var realFetch = window.fetch;
+            window.fetch = function (input, init) {
+                var u = typeof input === 'string' ? input : (input && input.url) || String(input);
+                var method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+                var hit = lookup(u);
+                if (hit && hit.url && method === 'GET') return realFetch(hit.url);
+                var p = realFetch.apply(this, arguments);
+                if (hit) {
+                    var warn = function () { say('This app asked its server for ' + method + ' /' + hit.rel + '. The backend is not running in preview, so anything that depends on it stays empty.', 'note'); };
+                    p.then(function (res) { if (res.status === 404 || res.status === 405) warn(); }, warn);
+                }
+                return p;
+            };
+            var xhrOpen = XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open = function (method, url) {
+                var hit = lookup(String(url));
+                if (hit && hit.url) arguments[1] = hit.url;
+                return xhrOpen.apply(this, arguments);
+            };
+
+            var ATTRS = { IMG: ['src'], SOURCE: ['src'], VIDEO: ['src', 'poster'], AUDIO: ['src'], SCRIPT: ['src'], LINK: ['href'], EMBED: ['src'] };
+            var setAttr = Element.prototype.setAttribute;
+            function fix(el) {
+                var list = ATTRS[el.tagName];
+                if (!list) return;
+                list.forEach(function (a) {
+                    var v = el.getAttribute(a), hit = v && lookup(v);
+                    if (hit && hit.url) setAttr.call(el, a, hit.url);
+                });
+            }
+            Element.prototype.setAttribute = function (name, value) {
+                var list = ATTRS[this.tagName];
+                if (list && list.indexOf(String(name).toLowerCase()) >= 0) {
+                    var hit = lookup(String(value));
+                    if (hit && hit.url) value = hit.url;
+                }
+                return setAttr.call(this, name, value);
+            };
+            [[window.HTMLImageElement, 'src'], [window.HTMLSourceElement, 'src'], [window.HTMLMediaElement, 'src'], [window.HTMLScriptElement, 'src'], [window.HTMLLinkElement, 'href']].forEach(function (pair) {
+                var proto = pair[0] && pair[0].prototype, d = proto && Object.getOwnPropertyDescriptor(proto, pair[1]);
+                if (!d || !d.set) return;
+                Object.defineProperty(proto, pair[1], {
+                    configurable: true, enumerable: d.enumerable, get: d.get,
+                    set: function (v) { var hit = lookup(String(v)); d.set.call(this, hit && hit.url ? hit.url : v); }
+                });
+            });
+            new MutationObserver(function (list) {
+                list.forEach(function (m) {
+                    if (m.type === 'attributes') { fix(m.target); return; }
+                    m.addedNodes.forEach(function (n) {
+                        if (n.nodeType !== 1) return;
+                        fix(n);
+                        if (n.querySelectorAll) n.querySelectorAll('img,source,video,audio,script,link,embed').forEach(fix);
+                    });
+                });
+            }).observe(document, { subtree: true, childList: true, attributes: true, attributeFilter: ['src', 'href', 'poster'] });
+
+            // --- links: other pages of the project switch the preview, outside links open a new tab ---
+            window.addEventListener('click', function (e) {
+                if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey) return;
+                var a = e.target && e.target.closest && e.target.closest('a[href]');
+                if (!a) return;
+                var href = a.getAttribute('href');
+                if (!href || href.charAt(0) === '#' || /^(javascript:|mailto:|tel:)/i.test(href)) return;
+                var hit = lookup(href);
+                e.preventDefault();
+                if (!hit) window.open(a.href, '_blank', 'noopener');
+                else if (hit.page && window.parent !== window) window.parent.postMessage({ gitfastPreviewPage: hit.page }, '*');
+                else if (hit.url) window.open(hit.url, '_blank');
+            });
+        }
+
+        // Builds the page the preview shows. Plain HTML/CSS/JS sites stay instant; projects that use
+        // imports, JSX or TypeScript are compiled here first.
+        async function buildPreview(onStatus) {
+            const entry = pickPreviewEntry();
+            if (!entry) return { entry: null, notes: [], html: messagePage(noPageMessage()) };
+
+            const ctx = makePreviewContext(entry);
+            const dom = new DOMParser().parseFromString(state.files.get(entry).content.replace(/%PUBLIC_URL%/g, ''), 'text/html');
+            const local = (ref, dir) => resolveSite(ref, dir === undefined ? ctx.siteRoot : dir, ctx);
+            const inlined = new Set();
+
+            // 1. Scripts
+            const jobs = [];
+            dom.querySelectorAll('script').forEach((script, i) => {
+                const type = (script.getAttribute('type') || '').toLowerCase();
+                const src = script.getAttribute('src');
+                const path = src ? local(src) : null;
+                if (src && (!path || state.files.get(path).binary)) return; // CDN script, or not in the project
+                const inBrowserBabel = /babel|jsx/.test(type);
+                const isModule = type === 'module' || (path && /\.(jsx|tsx|ts|mts)$/i.test(path) && !inBrowserBabel);
+                if (isModule) {
+                    if (path) jobs.push({ script, path });
+                    else if (/\b(import|export)\b/.test(script.textContent)) jobs.push({ script, path: `${ctx.siteRoot}__inline_${i}.jsx`, source: script.textContent });
+                } else if (path) {
+                    script.removeAttribute('src');
+                    script.textContent = escapeScript(state.files.get(path).content);
+                    inlined.add(path);
                 }
             });
 
-            dom.querySelectorAll('script[src]').forEach((script) => {
-                const hit = lookup(script.getAttribute('src'));
-                if (!hit || hit.file.binary) return;
-                if (/\.(jsx|tsx?|vue|svelte)$/i.test(hit.path)) { needsBuild = true; return; }
-                script.removeAttribute('src');
-                script.textContent = escapeScript(hit.file.content);
-                inlined.add(hit.path);
-            });
+            // Create React App: the page has no script tag, the entry is src/index.*
+            if (!jobs.length && (ctx.deps['react-scripts'] || ctx.publicDir === ctx.siteRoot)) {
+                const start = ['index', 'main'].flatMap((n) => ['.tsx', '.ts', '.jsx', '.js'].map((e) => `${ctx.projectDir}src/${n}${e}`)).find((p) => state.files.has(p));
+                if (start) {
+                    const script = dom.createElement('script');
+                    dom.body.appendChild(script);
+                    jobs.push({ script, path: start });
+                }
+            }
 
-            dom.querySelectorAll('img[src], source[src], video[src], audio[src]').forEach((el) => {
-                const hit = lookup(el.getAttribute('src'));
-                if (hit) el.setAttribute('src', toDataUri(hit.path, hit.file));
-            });
+            if (jobs.length) {
+                try {
+                    if (!window.ts && onStatus) onStatus('getting the preview compiler (first time only)…');
+                    await loadCompiler();
+                    finishPreviewContext(ctx);
+                    const seen = new Set();
+                    for (const job of jobs) {
+                        const rec = walkModule(job.path, ctx, seen, job.source);
+                        job.script.textContent = '';
+                        job.script.setAttribute('type', 'module');
+                        job.script.setAttribute('src', rec.url);
+                    }
+                } catch (e) {
+                    console.error(e);
+                    ctx.notes.add(e.message);
+                }
+            }
 
-            // Same behaviour as before: style.css / script.js next to the page apply even if the page doesn't link them
-            const css = state.files.get(baseDir + 'style.css');
-            if (css && !css.binary && css.content && !inlined.has(baseDir + 'style.css')) {
+            // 2. Stylesheets
+            dom.querySelectorAll('style').forEach((style) => {
+                if (/@import\s+(?:url\()?['"]tailwindcss/.test(style.textContent)) ctx.tailwind = 4;
+                else if (/@tailwind\s/.test(style.textContent) && !ctx.tailwind) ctx.tailwind = 3;
+                style.textContent = inlineCssUrls(style.textContent, ctx.siteRoot, ctx);
+            });
+            const addStyle = (path, replace) => {
                 const style = dom.createElement('style');
-                style.textContent = inlineCssUrls(css.content, baseDir);
-                dom.head.appendChild(style);
-            }
-            const js = state.files.get(baseDir + 'script.js');
-            if (js && !js.binary && js.content && !inlined.has(baseDir + 'script.js')) {
-                const script = dom.createElement('script');
-                script.textContent = escapeScript(`try { ${js.content} } catch(e) { console.error(e); }`);
-                dom.body.appendChild(script);
+                style.setAttribute('data-file', path);
+                style.textContent = processCss(path, ctx);
+                if (replace) {
+                    if (replace.getAttribute('media')) style.setAttribute('media', replace.getAttribute('media'));
+                    replace.replaceWith(style);
+                } else dom.head.appendChild(style);
+                inlined.add(path);
+            };
+            dom.querySelectorAll('link[href]').forEach((link) => {
+                const path = local(link.getAttribute('href'));
+                if (!path) return;
+                const rel = (link.getAttribute('rel') || '').toLowerCase();
+                if (rel.includes('stylesheet') && !state.files.get(path).binary) addStyle(path, link);
+                else link.setAttribute('href', assetUrl(path));
+            });
+            for (const path of ctx.cssFiles) if (!inlined.has(path)) addStyle(path);
+            for (const url of ctx.externalCss) {
+                const link = dom.createElement('link');
+                link.setAttribute('rel', 'stylesheet');
+                link.setAttribute('href', url);
+                dom.head.appendChild(link);
             }
 
-            return { entry, needsBuild, html: '<!DOCTYPE html>\n' + dom.documentElement.outerHTML };
+            // Same behaviour as before for simple sites: style.css / script.js next to the page apply even if not linked
+            if (!jobs.length) {
+                const css = state.files.get(ctx.siteRoot + 'style.css');
+                if (css && !css.binary && css.content && !inlined.has(ctx.siteRoot + 'style.css')) addStyle(ctx.siteRoot + 'style.css');
+                const js = state.files.get(ctx.siteRoot + 'script.js');
+                if (js && !js.binary && js.content && !inlined.has(ctx.siteRoot + 'script.js')) {
+                    const script = dom.createElement('script');
+                    script.textContent = escapeScript(`try { ${js.content} } catch(e) { console.error(e); }`);
+                    dom.body.appendChild(script);
+                }
+            }
+
+            // 3. Images, media, icons written straight into the HTML
+            dom.querySelectorAll('[src]:not(script), [poster], [srcset], [style*="url("]').forEach((el) => {
+                for (const attr of ['src', 'poster']) {
+                    const path = el.hasAttribute(attr) ? local(el.getAttribute(attr)) : null;
+                    if (path) el.setAttribute(attr, assetUrl(path));
+                }
+                if (el.hasAttribute('srcset')) {
+                    el.setAttribute('srcset', el.getAttribute('srcset').split(',').map((part) => {
+                        const [ref, ...size] = part.trim().split(/\s+/);
+                        const path = local(ref);
+                        return [path ? assetUrl(path) : ref, ...size].join(' ');
+                    }).join(', '));
+                }
+                if (el.hasAttribute('style')) el.setAttribute('style', inlineCssUrls(el.getAttribute('style'), ctx.siteRoot, ctx));
+            });
+
+            // 4. Things that must load before the app: helper script, import map, Tailwind
+            const head = [];
+            const assets = {}, pages = {};
+            const servable = /\.(png|jpe?g|gif|webp|avif|bmp|ico|svg|woff2?|ttf|otf|eot|mp4|webm|mov|mp3|wav|ogg|json|pdf|txt|csv|xml|wasm|webmanifest|md|glb|gltf)$/i;
+            const roots = [ctx.publicDir, ctx.siteRoot, ''].filter((r) => r !== null);
+            for (const path of state.files.keys()) {
+                for (const root of roots) {
+                    if (!path.startsWith(root)) continue;
+                    const key = path.slice(root.length);
+                    if (/\.html?$/i.test(path)) { if (!(key in pages)) pages[key] = path; }
+                    else if (!(key in assets) && (servable.test(path) || (root !== '' && /\.(css|m?js)$/i.test(path)))) assets[key] = assetUrl(path);
+                }
+            }
+            const shim = dom.createElement('script');
+            shim.textContent = escapeScript(`(${previewShim.toString()})(${JSON.stringify({ assets, pages, env: ctx.env, notes: [...ctx.notes].slice(0, 5) }).replace(/</g, '\\u003c')});`);
+            head.push(shim);
+
+            if (Object.keys(ctx.importMap).length) {
+                const map = dom.createElement('script');
+                map.setAttribute('type', 'importmap');
+                map.textContent = JSON.stringify({ imports: ctx.importMap }).replace(/</g, '\\u003c');
+                head.push(map);
+            }
+
+            if (ctx.tailwind) {
+                const tw = dom.createElement('script');
+                tw.setAttribute('src', ctx.tailwind === 4 || /^4/.test(pinnedVersion(ctx.deps.tailwindcss)) ? 'https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4' : 'https://cdn.tailwindcss.com');
+                head.push(tw);
+                if (!tw.getAttribute('src').includes('@4')) {
+                    const config = tailwindConfigScript(ctx);
+                    if (config) { const s = dom.createElement('script'); s.textContent = escapeScript(config); head.push(s); }
+                }
+                dom.querySelectorAll('style').forEach((style) => {
+                    if (TAILWIND_CSS.test(style.textContent)) style.setAttribute('type', 'text/tailwindcss');
+                });
+            }
+            dom.head.prepend(...head);
+
+            return { entry, notes: [...ctx.notes], html: '<!DOCTYPE html>\n' + dom.documentElement.outerHTML };
         }
 
-        function refreshPreview() {
-            const { entry, needsBuild, html } = buildPreview();
-            document.getElementById('previewFrame').srcdoc = html;
+        // A fresh iframe per run, so scripts from the previous run can't leak into this one
+        function writePreview(targetWindow, html) {
+            const write = () => {
+                const doc = targetWindow.document;
+                if (!doc || doc.__gitfastWritten) return;
+                doc.__gitfastWritten = true;
+                doc.open();
+                doc.write(html);
+                doc.close();
+            };
+            write();
+            targetWindow.addEventListener('load', write); // browsers that swap in about:blank late
+        }
 
+        function setPreviewLabel(text, warn) {
             const label = $('previewEntry');
-            label.innerText = !entry ? '' : needsBuild ? `${entry} — needs a build step, may show blank` : entry;
-            label.className = `font-mono font-medium normal-case tracking-normal truncate ${needsBuild ? 'text-amber-600' : 'text-slate-400'}`;
-            label.title = label.innerText;
+            label.innerText = text;
+            label.title = text;
+            label.className = `font-mono font-medium normal-case tracking-normal truncate ${warn ? 'text-amber-600' : 'text-slate-400'}`;
         }
 
-        // The "show site" button: opens the current preview full-size in its own tab
+        async function refreshPreview() {
+            const run = ++previewRun;
+            const entry = pickPreviewEntry();
+            let result;
+            try {
+                result = await buildPreview((status) => { if (run === previewRun) setPreviewLabel(`${entry} — ${status}`); });
+            } catch (e) {
+                console.error(e);
+                result = { entry, notes: [e.message], html: messagePage(`The preview couldn't be built: ${e.message}`) };
+            }
+            if (run !== previewRun) return; // a newer edit is already being built
+
+            const old = document.getElementById('previewFrame');
+            const frame = document.createElement('iframe');
+            frame.id = 'previewFrame';
+            frame.className = old.className;
+            old.replaceWith(frame);
+            writePreview(frame.contentWindow, result.html);
+
+            const notes = result.notes.length;
+            setPreviewLabel(!result.entry ? '' : notes ? `${result.entry} — ${notes} note${notes === 1 ? '' : 's'}, shown in the preview` : result.entry, notes > 0);
+        }
+
+        // The "show site" button: opens the current preview full-size in its own tab.
+        // The tab loads this same page in a bare "viewer" mode and asks this window for the built preview.
         function openPreviewInTab() {
-            const { entry, html } = buildPreview();
-            if (!entry) {
-                alert("This project has no HTML file to show.");
+            if (!pickPreviewEntry()) {
+                alert(noPageMessage());
                 return;
             }
-            if (state.previewBlobUrl) URL.revokeObjectURL(state.previewBlobUrl);
-            state.previewBlobUrl = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
-            const win = window.open(state.previewBlobUrl, '_blank');
+            const win = window.open(location.href.split(/[?#]/)[0] + '?gitfast-preview-tab=1', '_blank');
             if (!win) alert("Your browser blocked the new tab. Allow pop-ups for this page and try again.");
         }
+
+        async function runPreviewTab() {
+            document.title = 'Preview · GitFast Ultra';
+            const frame = document.createElement('iframe');
+            frame.id = 'previewTabFrame';
+            document.body.appendChild(frame);
+
+            let html;
+            try {
+                if (!window.opener || typeof window.opener.buildPreview !== 'function') throw new Error('closed');
+                html = (await window.opener.buildPreview()).html;
+            } catch (e) {
+                html = messagePage(e.message === 'closed'
+                    ? "This tab shows the preview from GitFast Ultra, but the editor tab it came from is no longer open. Go back to the editor and press the button again."
+                    : `The preview couldn't be built: ${e.message}`);
+            }
+            writePreview(frame.contentWindow, html);
+        }
+
+        // A link inside the preview pointed at another page of the project
+        window.addEventListener('message', (e) => {
+            const frame = document.getElementById('previewFrame');
+            const page = e.data && e.data.gitfastPreviewPage;
+            if (!frame || e.source !== frame.contentWindow || typeof page !== 'string' || !state.files.has(page)) return;
+            state.previewPath = page;
+            refreshPreview();
+        });
 
         // --- RESIZABLE SPLIT (code <-> preview) ---
         function initSplitter() {
