@@ -1,2 +1,3 @@
-# gitultramax
-Created with GitFast Ultra
+# My Awesome Project
+
+Deployed with GitFast Ultra.
