@@ -1,0 +1,1492 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GitFast Ultra - The Ultimate GitHub IDE</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'Fira Code', 'monospace'],
+                    },
+                    colors: {
+                        'sidebar': '#0f172a',
+                        'editor': '#1e293b',
+                        'accent': '#38bdf8',
+                        'success': '#4ade80',
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+        
+        :root {
+            --glass-border: 1px solid rgba(255, 255, 255, 0.08);
+            --glass-bg: rgba(30, 41, 59, 0.7);
+        }
+
+        body {
+            background-color: #0f1115;
+            color: #e2e8f0;
+            overflow: hidden; /* App-like feel */
+        }
+
+        /* Scrollbars */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #475569; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #64748b; }
+
+        /* Utilities */
+        .glass-panel {
+            background: var(--glass-bg);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: var(--glass-border);
+        }
+
+        .code-area {
+            font-family: 'JetBrains Mono', monospace;
+            line-height: 1.6;
+            tab-size: 4;
+            background: transparent;
+            color: #e2e8f0;
+            caret-color: #38bdf8;
+        }
+        
+        /* Syntax highlighting-ish colors for plain text context */
+        .token-keyword { color: #c678dd; }
+        .token-string { color: #98c379; }
+
+        /* Loader */
+        .loader-ring {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+        }
+        .loader-ring:after {
+            content: " ";
+            display: block;
+            width: 16px;
+            height: 16px;
+            margin: 2px;
+            border-radius: 50%;
+            border: 2px solid #fff;
+            border-color: #fff transparent #fff transparent;
+            animation: loader-ring 1.2s linear infinite;
+        }
+        @keyframes loader-ring {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        /* Animations */
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .animate-slide-in { animation: slideIn 0.3s ease-out forwards; }
+
+        /* Preview Frame */
+        #previewFrame {
+            background: white;
+            transition: opacity 0.2s;
+        }
+        #previewPanel { min-width: 280px; }
+
+        /* File explorer */
+        .tree-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            width: 100%;
+            height: 26px;
+            padding-right: 10px;
+            font-size: 12px;
+            text-align: left;
+            color: #94a3b8;
+            white-space: nowrap;
+            border-left: 2px solid transparent;
+            cursor: pointer;
+        }
+        .tree-row:hover { background: rgba(30, 41, 59, 0.7); color: #e2e8f0; }
+        .tree-row:focus-visible { outline: 1px solid #38bdf8; outline-offset: -1px; }
+        .tree-row.active {
+            background: rgba(56, 189, 248, 0.12);
+            color: #fff;
+            border-left-color: #38bdf8;
+        }
+        .tree-row .tree-icon { width: 16px; text-align: center; flex-shrink: 0; }
+        .tree-row .tree-name { overflow: hidden; text-overflow: ellipsis; }
+        .tree-chevron {
+            width: 8px;
+            flex-shrink: 0;
+            font-size: 8px;
+            color: #64748b;
+            transition: transform 0.15s;
+        }
+        .tree-chevron.open { transform: rotate(90deg); }
+
+        /* Draggable divider between code and preview */
+        .split-handle {
+            position: relative;
+            width: 7px;
+            flex-shrink: 0;
+            cursor: col-resize;
+            background: #0b0d11;
+            border-left: 1px solid #1e293b;
+            border-right: 1px solid #1e293b;
+            touch-action: none;
+            transition: background 0.15s;
+            z-index: 15;
+        }
+        .split-handle::after {
+            content: "";
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 2px;
+            height: 36px;
+            transform: translate(-50%, -50%);
+            border-radius: 2px;
+            background: #475569;
+            transition: background 0.15s;
+        }
+        .split-handle:hover,
+        .split-handle.dragging { background: rgba(56, 189, 248, 0.25); }
+        .split-handle:hover::after,
+        .split-handle.dragging::after { background: #38bdf8; }
+        body.resizing { cursor: col-resize; user-select: none; -webkit-user-select: none; }
+        body.resizing iframe { pointer-events: none; }
+
+        /* Image shown in the editor area for binary image files */
+        .checker {
+            background-color: #1e293b;
+            background-image:
+                linear-gradient(45deg, #273449 25%, transparent 25%, transparent 75%, #273449 75%),
+                linear-gradient(45deg, #273449 25%, transparent 25%, transparent 75%, #273449 75%);
+            background-size: 16px 16px;
+            background-position: 0 0, 8px 8px;
+        }
+        
+        /* Tab Active State */
+        .tab-btn.active {
+            background: rgba(56, 189, 248, 0.15);
+            color: #38bdf8;
+            border-bottom: 2px solid #38bdf8;
+        }
+    </style>
+</head>
+<body class="h-screen flex flex-col text-sm">
+
+    <!-- TOP BAR -->
+    <header class="h-14 border-b border-slate-800 bg-[#0b0d11] flex items-center justify-between px-4 shrink-0 z-20">
+        <div class="flex items-center gap-4">
+            <div class="flex items-center gap-2 group cursor-pointer">
+                <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-600 to-cyan-500 flex items-center justify-center shadow-lg shadow-blue-500/20 group-hover:scale-105 transition-transform">
+                    <i class="fas fa-bolt text-white text-sm"></i>
+                </div>
+                <h1 class="font-bold text-lg tracking-tight text-slate-100">GitFast <span class="text-accent font-black text-xs uppercase tracking-widest ml-1 bg-accent/10 px-2 py-0.5 rounded-full">Ultra</span></h1>
+            </div>
+            
+            <div class="h-6 w-px bg-slate-800 mx-2"></div>
+
+            <!-- Repo Selector -->
+            <div class="relative group">
+                <div class="flex items-center gap-2 bg-slate-800/50 hover:bg-slate-800 border border-slate-700 hover:border-slate-600 rounded-md px-3 py-1.5 transition-all cursor-pointer w-64" onclick="toggleRepoDropdown()">
+                    <i class="fas fa-box-archive text-slate-400 text-xs"></i>
+                    <input type="text" id="repoNameInput" class="bg-transparent border-none outline-none text-xs w-full text-slate-200 placeholder-slate-500 font-mono" placeholder="username/repo-name" autocomplete="off" oninput="handleRepoInput(this.value)">
+                    <i class="fas fa-chevron-down text-slate-500 text-[10px]"></i>
+                </div>
+                <!-- Dropdown -->
+                <div id="repoDropdown" class="absolute top-full left-0 mt-2 w-80 bg-[#1e293b] border border-slate-700 rounded-lg shadow-2xl overflow-hidden hidden z-50">
+                    <div class="p-2 border-b border-slate-700 bg-slate-900/50">
+                        <p class="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Your Repositories</p>
+                    </div>
+                    <div id="repoList" class="max-h-60 overflow-y-auto">
+                        <!-- Items injected here -->
+                        <div class="p-4 text-center text-slate-500 text-xs italic">Connect token to load repos</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Upload ZIP -->
+            <button id="zipBtn" onclick="document.getElementById('zipInput').click()" class="flex items-center gap-2 bg-slate-800/50 hover:bg-slate-800 border border-slate-700 hover:border-accent/60 rounded-md px-3 py-1.5 text-xs font-semibold text-slate-200 transition-all disabled:opacity-60 disabled:cursor-wait" title="Upload a project .zip — every file inside is unpacked into the explorer">
+                <i id="zipBtnIcon" class="fas fa-upload text-accent text-xs"></i>
+                <span id="zipBtnLabel">Upload ZIP</span>
+            </button>
+            <input type="file" id="zipInput" accept=".zip,application/zip,application/x-zip-compressed" class="hidden" onchange="handleZipUpload(this)">
+        </div>
+
+        <div class="flex items-center gap-4">
+            
+            <!-- User Status (Clickable) -->
+            <div id="userProfile" onclick="openSettings()" class="hidden items-center gap-3 px-3 py-1.5 rounded-full bg-slate-900 border border-slate-800 hover:border-slate-600 cursor-pointer transition-all">
+                <img id="userAvatar" src="" class="w-5 h-5 rounded-full border border-slate-700">
+                <span id="userName" class="font-medium text-slate-300 text-xs">User</span>
+            </div>
+
+            <!-- Token Input (Compact) -->
+            <div id="tokenContainer" class="relative group">
+                <input type="password" id="ghToken" oninput="saveToken(this.value)" class="bg-slate-900 border border-slate-700 focus:border-accent rounded-full py-1.5 pl-4 pr-10 text-xs outline-none w-32 focus:w-64 transition-all duration-300" placeholder="GitHub Token...">
+                <i class="fas fa-key absolute right-3 top-1/2 -translate-y-1/2 text-slate-600 text-xs"></i>
+            </div>
+            
+            <!-- Settings Button -->
+            <button onclick="openSettings()" class="w-8 h-8 flex items-center justify-center rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white transition-colors">
+                <i class="fas fa-cog"></i>
+            </button>
+        </div>
+    </header>
+
+    <!-- MAIN WORKSPACE -->
+    <main id="workspace" class="flex-grow flex overflow-hidden">
+        
+        <!-- SIDEBAR: FILE EXPLORER -->
+        <aside id="sidebar" class="w-60 bg-[#0b0d11] border-r border-slate-800 flex flex-col shrink-0 z-10">
+            <div class="h-10 border-b border-slate-800 flex items-center justify-between px-3 shrink-0">
+                <span class="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Files</span>
+                <span id="fileCount" class="text-[10px] font-mono text-slate-500"></span>
+            </div>
+
+            <div id="fileTree" class="flex-grow overflow-y-auto overflow-x-hidden py-2 select-none">
+                <!-- Tree injected here -->
+            </div>
+
+            <div class="border-t border-slate-800 p-2 shrink-0">
+                <button onclick="togglePreview()" class="w-full h-8 rounded-lg flex items-center gap-2 px-2 text-xs text-slate-400 hover:text-white hover:bg-slate-800 transition-all" title="Toggle Preview">
+                    <i class="fas fa-columns w-4 text-center"></i>
+                    <span>Toggle preview</span>
+                </button>
+            </div>
+        </aside>
+
+        <!-- EDITOR AREA -->
+        <section class="flex-grow flex flex-col relative bg-[#0f1115] min-w-0">
+            <!-- File Info Bar -->
+            <div class="h-10 border-b border-slate-800 flex items-center justify-between gap-4 px-4 bg-[#0f1115] shrink-0">
+                <div class="flex items-center gap-2 min-w-0">
+                    <i id="fileIcon" class="fab fa-html5 text-orange-500"></i>
+                    <span id="fileName" class="font-mono text-xs text-slate-300 truncate">index.html</span>
+                    <span id="fileType" class="shrink-0 text-[10px] text-slate-500 bg-slate-800/70 rounded px-1.5 py-0.5">HTML</span>
+                </div>
+                <div class="flex items-center gap-3 min-w-0">
+                     <span id="statusMsg" class="text-[10px] text-slate-500 uppercase font-bold tracking-wider truncate">Ready</span>
+                </div>
+            </div>
+
+            <!-- Code Editor -->
+            <div class="flex-grow relative group min-h-0">
+                <textarea id="mainEditor" spellcheck="false" class="code-area absolute inset-0 w-full h-full p-6 resize-none outline-none text-sm z-10" oninput="handleInput()"></textarea>
+
+                <!-- Shown instead of the editor for images, fonts and other binary files -->
+                <div id="binaryView" class="absolute inset-0 z-10 hidden flex-col items-center justify-center gap-4 p-8 text-center overflow-auto">
+                    <img id="binaryImg" alt="" class="checker hidden max-w-full max-h-[60%] rounded-lg border border-slate-700">
+                    <i id="binaryIcon" class="fas fa-file text-4xl text-slate-600"></i>
+                    <div>
+                        <p id="binaryName" class="font-mono text-xs text-slate-300 break-all"></p>
+                        <p id="binaryMeta" class="text-[11px] text-slate-500 mt-1"></p>
+                    </div>
+                </div>
+
+                <!-- Loading overlay for fetching files -->
+                <div id="fileLoader" class="absolute inset-0 bg-slate-900/50 z-20 hidden flex items-center justify-center">
+                     <div class="loader-ring"></div>
+                </div>
+            </div>
+
+            <!-- Bottom Actions -->
+            <div class="h-16 border-t border-slate-800 bg-[#0b0d11] flex items-center justify-between gap-4 px-6 shrink-0">
+                <div class="flex items-center gap-2 text-xs text-slate-500 min-w-0">
+                    <i class="fas fa-layer-group text-slate-600"></i>
+                    <span id="workspaceInfo" class="truncate"></span>
+                </div>
+                <div class="flex items-center gap-3 shrink-0">
+                    <button id="deployBtn" onclick="deploy()" class="bg-blue-600 hover:bg-blue-500 text-white px-6 py-2 rounded-lg text-xs font-bold uppercase tracking-wider flex items-center gap-2 transition-all shadow-lg shadow-blue-900/20 active:scale-95">
+                        <i class="fas fa-rocket"></i> Deploy
+                    </button>
+                </div>
+            </div>
+        </section>
+
+        <!-- DRAG HANDLE (code <-> preview) -->
+        <div id="splitHandle" class="split-handle" role="separator" aria-orientation="vertical" title="Drag to resize · double-click to reset"></div>
+
+        <!-- PREVIEW AREA -->
+        <section id="previewPanel" class="bg-white relative flex flex-col shrink-0" style="width: 45%">
+            <div class="h-10 bg-slate-100 border-b border-slate-200 flex items-center justify-between gap-3 px-3 shrink-0">
+                <span class="text-[10px] font-bold text-slate-400 uppercase tracking-widest flex items-center gap-2 min-w-0">
+                    <i class="fas fa-circle text-red-400 text-[6px]"></i>
+                    <span class="shrink-0">Live Preview</span>
+                    <span id="previewEntry" class="font-mono font-medium normal-case tracking-normal truncate"></span>
+                </span>
+                <div class="flex gap-2 shrink-0">
+                    <button onclick="refreshPreview()" class="text-slate-400 hover:text-slate-600" title="Refresh preview"><i class="fas fa-sync-alt text-xs"></i></button>
+                    <button onclick="openPreviewInTab()" class="text-slate-400 hover:text-slate-600" title="Open preview in a new tab"><i class="fas fa-external-link-alt text-xs"></i></button>
+                    <button onclick="togglePreview()" class="text-slate-400 hover:text-slate-600" title="Close preview"><i class="fas fa-times text-xs"></i></button>
+                </div>
+            </div>
+            <iframe id="previewFrame" class="flex-grow w-full h-full bg-white"></iframe>
+            
+            <!-- Deployment Success Overlay -->
+            <div id="deployOverlay" class="absolute inset-0 bg-slate-900/95 backdrop-blur-md z-50 flex flex-col items-center justify-center text-center p-8 hidden animate-slide-in">
+                <div class="w-16 h-16 bg-green-500/10 rounded-full flex items-center justify-center mb-6">
+                    <i class="fas fa-check text-2xl text-green-500"></i>
+                </div>
+                <h2 class="text-2xl font-bold text-white mb-2">Deployment Started!</h2>
+                
+                <div class="mb-8 mt-4">
+                    <div id="timerContainer" class="flex flex-col items-center p-6 bg-slate-800/50 rounded-2xl border border-slate-700">
+                        <span class="text-5xl font-mono font-bold text-white mb-2" id="deployTimer">30</span>
+                        <span class="text-[10px] text-accent uppercase tracking-widest font-bold">Seconds remaining</span>
+                    </div>
+                </div>
+
+                <p id="propagationMessage" class="text-slate-400 text-sm mb-8 max-w-xs mx-auto">
+                    Waiting for GitHub to propagate changes to avoid 404 errors.
+                </p>
+
+                <div class="flex flex-wrap justify-center gap-4">
+                    <a id="liveLink" href="#" target="_blank" class="bg-green-500 hover:bg-green-400 text-black font-bold py-3 px-8 rounded-xl transition-all active:scale-95 text-xs uppercase tracking-widest flex items-center gap-2">
+                        Visit Live Site
+                    </a>
+                    <button onclick="closeOverlay()" class="bg-slate-800 hover:bg-slate-700 text-white font-bold py-3 px-8 rounded-xl transition-all text-xs uppercase tracking-widest">
+                        Keep Editing
+                    </button>
+                </div>
+            </div>
+
+             <!-- Deployment Loading Overlay -->
+            <div id="loadingOverlay" class="absolute inset-0 bg-slate-900/90 backdrop-blur-sm z-50 flex flex-col items-center justify-center text-center p-8 hidden">
+                <div class="loader-ring mb-4"></div>
+                <h3 class="text-lg font-bold text-white">Deploying...</h3>
+                <p id="loadingStep" class="text-slate-500 text-xs mt-2 font-mono max-w-full break-all">Initializing...</p>
+                <div class="w-64 max-w-full h-1 bg-slate-800 rounded-full mt-6 overflow-hidden">
+                    <div id="progressBar" class="h-full bg-blue-500 w-0 transition-all duration-300"></div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- SETTINGS MODAL (Token Management Only) -->
+    <div id="settingsModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-[100] hidden flex items-center justify-center p-4" onclick="if(event.target === this) closeSettings()">
+        <div class="bg-[#1e293b] border border-slate-700 rounded-2xl w-full max-w-lg overflow-hidden shadow-2xl flex flex-col">
+            <div class="p-6 border-b border-slate-700 flex justify-between items-center bg-[#0f172a]">
+                <div class="flex items-center gap-3">
+                    <img id="settingsAvatar" class="w-10 h-10 rounded-full border border-slate-600">
+                    <div>
+                        <h2 id="settingsName" class="text-lg font-bold text-white">User Settings</h2>
+                        <p class="text-xs text-slate-400">Manage your connection</p>
+                    </div>
+                </div>
+                <button onclick="closeSettings()" class="text-slate-400 hover:text-white"><i class="fas fa-times"></i></button>
+            </div>
+            
+            <div class="p-8 bg-[#0f1115]">
+                <!-- Token Section -->
+                <div>
+                    <h3 class="text-sm font-bold text-white uppercase tracking-widest mb-4 border-l-2 border-accent pl-3">GitHub Connection</h3>
+                    <div class="bg-[#1e293b] p-6 rounded-xl border border-slate-700">
+                        <label class="block text-xs text-slate-400 mb-2">Personal Access Token</label>
+                        <div class="flex gap-4">
+                            <input type="password" id="settingsTokenInput" class="flex-grow bg-[#0f1115] border border-slate-700 rounded-lg px-4 py-3 text-sm text-white focus:border-accent outline-none" placeholder="ghp_xxxxxxxxxxxx">
+                            <button onclick="updateTokenFromSettings()" class="bg-slate-700 hover:bg-slate-600 text-white px-6 rounded-lg text-xs font-bold uppercase tracking-wider">Update</button>
+                        </div>
+                        <p class="text-[10px] text-slate-500 mt-2">Token is stored locally in your browser. We do not sync it to any server.</p>
+                        <div class="mt-4 pt-4 border-t border-slate-700">
+                            <button onclick="logout()" class="text-red-500 text-xs font-bold uppercase hover:text-red-400">Disconnect & Clear Token</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- HELPERS ---
+        const $ = (id) => document.getElementById(id);
+
+        function escapeHtml(str) {
+            return String(str).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+        }
+
+        function bytesToBase64(bytes) {
+            let bin = '';
+            const CHUNK = 0x8000;
+            for (let i = 0; i < bytes.length; i += CHUNK) {
+                bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+            }
+            return btoa(bin);
+        }
+
+        function base64ToBytes(b64) {
+            const bin = atob(b64);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            return bytes;
+        }
+
+        const textToBase64 = (str) => bytesToBase64(new TextEncoder().encode(str));
+
+        function formatBytes(n) {
+            if (n < 1024) return `${n} B`;
+            if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10240 ? 1 : 0)} KB`;
+            return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+        }
+
+        const basename = (path) => path.slice(path.lastIndexOf('/') + 1);
+        const dirname = (path) => path.slice(0, path.lastIndexOf('/') + 1); // '' or 'dir/sub/'
+        const extname = (path) => {
+            const name = basename(path);
+            const dot = name.lastIndexOf('.');
+            return dot > 0 ? name.slice(dot + 1).toLowerCase() : '';
+        };
+        const sortNames = (a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+
+        function setStatus(msg) {
+            $('statusMsg').innerText = msg;
+        }
+
+        // --- FILE TYPE DETECTION ---
+        // [icon classes, colour, label]
+        const FILE_TYPES = {
+            html: ['fab fa-html5', 'text-orange-500', 'HTML'],
+            htm: ['fab fa-html5', 'text-orange-500', 'HTML'],
+            css: ['fab fa-css3-alt', 'text-blue-500', 'CSS'],
+            scss: ['fab fa-sass', 'text-pink-400', 'Sass'],
+            sass: ['fab fa-sass', 'text-pink-400', 'Sass'],
+            less: ['fab fa-less', 'text-indigo-400', 'Less'],
+            js: ['fab fa-js', 'text-yellow-400', 'JavaScript'],
+            mjs: ['fab fa-js', 'text-yellow-400', 'JavaScript'],
+            cjs: ['fab fa-js', 'text-yellow-400', 'JavaScript'],
+            jsx: ['fab fa-react', 'text-cyan-400', 'React JSX'],
+            ts: ['fas fa-file-code', 'text-blue-400', 'TypeScript'],
+            tsx: ['fab fa-react', 'text-blue-400', 'React TSX'],
+            vue: ['fab fa-vuejs', 'text-emerald-400', 'Vue'],
+            svelte: ['fas fa-file-code', 'text-orange-400', 'Svelte'],
+            json: ['fas fa-file-code', 'text-yellow-300', 'JSON'],
+            md: ['fab fa-markdown', 'text-white', 'Markdown'],
+            markdown: ['fab fa-markdown', 'text-white', 'Markdown'],
+            py: ['fab fa-python', 'text-sky-400', 'Python'],
+            php: ['fab fa-php', 'text-indigo-300', 'PHP'],
+            java: ['fab fa-java', 'text-red-400', 'Java'],
+            kt: ['fas fa-file-code', 'text-purple-400', 'Kotlin'],
+            rb: ['fas fa-gem', 'text-red-400', 'Ruby'],
+            go: ['fas fa-file-code', 'text-cyan-400', 'Go'],
+            rs: ['fab fa-rust', 'text-orange-300', 'Rust'],
+            c: ['fas fa-file-code', 'text-blue-300', 'C'],
+            h: ['fas fa-file-code', 'text-blue-300', 'C header'],
+            cpp: ['fas fa-file-code', 'text-blue-300', 'C++'],
+            cs: ['fas fa-file-code', 'text-green-400', 'C#'],
+            swift: ['fab fa-swift', 'text-orange-400', 'Swift'],
+            sql: ['fas fa-database', 'text-pink-300', 'SQL'],
+            prisma: ['fas fa-database', 'text-teal-300', 'Prisma schema'],
+            graphql: ['fas fa-diagram-project', 'text-pink-400', 'GraphQL'],
+            sh: ['fas fa-terminal', 'text-green-400', 'Shell script'],
+            bash: ['fas fa-terminal', 'text-green-400', 'Shell script'],
+            zsh: ['fas fa-terminal', 'text-green-400', 'Shell script'],
+            bat: ['fas fa-terminal', 'text-green-400', 'Batch script'],
+            ps1: ['fas fa-terminal', 'text-green-400', 'PowerShell'],
+            yml: ['fas fa-gear', 'text-slate-400', 'YAML'],
+            yaml: ['fas fa-gear', 'text-slate-400', 'YAML'],
+            toml: ['fas fa-gear', 'text-slate-400', 'TOML'],
+            ini: ['fas fa-gear', 'text-slate-400', 'Config'],
+            conf: ['fas fa-gear', 'text-slate-400', 'Config'],
+            cfg: ['fas fa-gear', 'text-slate-400', 'Config'],
+            xml: ['fas fa-file-code', 'text-orange-300', 'XML'],
+            txt: ['fas fa-file-lines', 'text-slate-400', 'Text'],
+            log: ['fas fa-file-lines', 'text-slate-400', 'Log'],
+            csv: ['fas fa-file-csv', 'text-green-400', 'CSV'],
+            lock: ['fas fa-lock', 'text-slate-500', 'Lockfile'],
+            svg: ['fas fa-file-image', 'text-amber-300', 'SVG image'],
+            png: ['fas fa-file-image', 'text-purple-400', 'Image'],
+            jpg: ['fas fa-file-image', 'text-purple-400', 'Image'],
+            jpeg: ['fas fa-file-image', 'text-purple-400', 'Image'],
+            gif: ['fas fa-file-image', 'text-purple-400', 'Image'],
+            webp: ['fas fa-file-image', 'text-purple-400', 'Image'],
+            avif: ['fas fa-file-image', 'text-purple-400', 'Image'],
+            bmp: ['fas fa-file-image', 'text-purple-400', 'Image'],
+            ico: ['fas fa-file-image', 'text-purple-400', 'Icon'],
+            woff: ['fas fa-font', 'text-slate-400', 'Font'],
+            woff2: ['fas fa-font', 'text-slate-400', 'Font'],
+            ttf: ['fas fa-font', 'text-slate-400', 'Font'],
+            otf: ['fas fa-font', 'text-slate-400', 'Font'],
+            eot: ['fas fa-font', 'text-slate-400', 'Font'],
+            mp4: ['fas fa-file-video', 'text-rose-400', 'Video'],
+            webm: ['fas fa-file-video', 'text-rose-400', 'Video'],
+            mov: ['fas fa-file-video', 'text-rose-400', 'Video'],
+            mp3: ['fas fa-file-audio', 'text-rose-400', 'Audio'],
+            wav: ['fas fa-file-audio', 'text-rose-400', 'Audio'],
+            ogg: ['fas fa-file-audio', 'text-rose-400', 'Audio'],
+            pdf: ['fas fa-file-pdf', 'text-red-400', 'PDF'],
+            zip: ['fas fa-file-zipper', 'text-slate-400', 'Archive'],
+            gz: ['fas fa-file-zipper', 'text-slate-400', 'Archive'],
+            tar: ['fas fa-file-zipper', 'text-slate-400', 'Archive'],
+        };
+
+        const SPECIAL_FILES = {
+            'dockerfile': ['fab fa-docker', 'text-sky-400', 'Dockerfile'],
+            'docker-compose.yml': ['fab fa-docker', 'text-sky-400', 'Docker Compose'],
+            'docker-compose.yaml': ['fab fa-docker', 'text-sky-400', 'Docker Compose'],
+            'package.json': ['fab fa-npm', 'text-red-400', 'npm manifest'],
+            'package-lock.json': ['fab fa-npm', 'text-slate-500', 'npm lockfile'],
+            '.gitignore': ['fab fa-git-alt', 'text-orange-400', 'Git ignore'],
+            '.gitattributes': ['fab fa-git-alt', 'text-orange-400', 'Git config'],
+            'makefile': ['fas fa-terminal', 'text-green-400', 'Makefile'],
+            'procfile': ['fas fa-terminal', 'text-green-400', 'Procfile'],
+            'license': ['fas fa-scale-balanced', 'text-slate-400', 'License'],
+            'requirements.txt': ['fab fa-python', 'text-sky-400', 'Python requirements'],
+        };
+
+        const MIME_TYPES = {
+            png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
+            avif: 'image/avif', bmp: 'image/bmp', ico: 'image/x-icon', svg: 'image/svg+xml',
+            woff: 'font/woff', woff2: 'font/woff2', ttf: 'font/ttf', otf: 'font/otf', eot: 'application/vnd.ms-fontobject',
+            mp4: 'video/mp4', webm: 'video/webm', mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg',
+            json: 'application/json', pdf: 'application/pdf'
+        };
+
+        // Never worth trying to read as text
+        const BINARY_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'bmp', 'ico', 'woff', 'woff2', 'ttf', 'otf', 'eot',
+            'mp4', 'webm', 'mov', 'mp3', 'wav', 'ogg', 'pdf', 'zip', 'gz', 'tar', 'rar', '7z', 'exe', 'dll', 'so', 'dylib', 'class', 'jar',
+            'pyc', 'wasm', 'sqlite', 'db', 'psd']);
+
+        function getFileType(path) {
+            const name = basename(path).toLowerCase();
+            let hit = SPECIAL_FILES[name];
+            if (!hit && /^\.env(\.|$)/.test(name)) hit = ['fas fa-lock', 'text-amber-400', 'Environment'];
+            if (!hit) hit = FILE_TYPES[extname(path)];
+            if (!hit) hit = ['fas fa-file', 'text-slate-500', extname(path) ? extname(path).toUpperCase() + ' file' : 'File'];
+            return { icon: hit[0], color: hit[1], label: hit[2] };
+        }
+
+        // Turns raw bytes into a workspace file. Text stays editable; everything else is kept as base64.
+        function makeFile(path, bytes, extra) {
+            let text = null;
+            if (!BINARY_EXT.has(extname(path)) && !bytes.subarray(0, 8000).includes(0)) {
+                try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes); } catch (e) { text = null; }
+            }
+            if (text === null) {
+                return Object.assign({ binary: true, content: bytesToBase64(bytes), size: bytes.length, placeholder: false }, extra);
+            }
+            return Object.assign(makeTextFile(text), extra);
+        }
+
+        function makeTextFile(text, placeholder = false) {
+            // Remember Windows line endings so editing a file doesn't rewrite every line of it
+            const crlf = text.includes('\r\n') && !/(^|[^\r])\n/.test(text);
+            return { binary: false, content: text, crlf, placeholder };
+        }
+
+        // --- STATE MANAGEMENT ---
+        const DEFAULT_FILES = ['index.html', 'style.css', 'script.js', 'README.md'];
+
+        function defaultWorkspace() {
+            return new Map(DEFAULT_FILES.map((p) => [p, makeTextFile('', true)]));
+        }
+
+        const state = {
+            files: defaultWorkspace(),   // path -> { binary, content, crlf, size, placeholder, exec }
+            currentPath: 'index.html',
+            previewPath: null,           // last HTML file the user opened; the preview follows it
+            openFolders: new Set(),
+            importedZip: null,
+            token: localStorage.getItem('gitfast_token') || '',
+            user: null,
+            repos: [],
+            currentRepo: '',
+            previewActive: true,
+            previewBlobUrl: null
+        };
+
+        // --- INIT ---
+        window.onload = async () => {
+            if ("Notification" in window) Notification.requestPermission();
+
+            initSplitter();
+            $('fileTree').addEventListener('click', (e) => {
+                const row = e.target.closest('.tree-row');
+                if (!row) return;
+                if (row.dataset.folder !== undefined) toggleFolder(row.dataset.folder);
+                else openFile(row.dataset.path);
+            });
+
+            renderTree();
+            openFile('index.html');
+            refreshPreview();
+
+            if (state.token) {
+                $('ghToken').value = '••••••••'; // Masked
+                $('settingsTokenInput').value = state.token;
+                await fetchUserData();
+                fetchRepos();
+            }
+        };
+
+        // --- AUTH & USER DATA ---
+        async function fetchUserData() {
+            try {
+                const res = await fetch('https://api.github.com/user', {
+                    headers: { 'Authorization': `token ${state.token}` }
+                });
+                if (res.ok) {
+                    state.user = await res.json();
+                    
+                    // Top Bar UI
+                    document.getElementById('userAvatar').src = state.user.avatar_url;
+                    document.getElementById('userName').innerText = state.user.login;
+                    document.getElementById('userProfile').classList.remove('hidden');
+                    document.getElementById('userProfile').classList.add('flex');
+                    document.getElementById('tokenContainer').classList.add('hidden');
+                    
+                    // Settings Modal UI
+                    document.getElementById('settingsAvatar').src = state.user.avatar_url;
+                    document.getElementById('settingsName').innerText = state.user.name || state.user.login;
+                }
+            } catch (e) { console.error(e); }
+        }
+
+        async function fetchRepos() {
+            try {
+                const res = await fetch(`https://api.github.com/user/repos?sort=updated&per_page=100`, {
+                    headers: { 'Authorization': `token ${state.token}` }
+                });
+                if (res.ok) {
+                    state.repos = await res.json();
+                    renderRepoList();
+                }
+            } catch (e) { console.error(e); }
+        }
+
+        function saveToken(val) {
+            if (val.trim().startsWith('ghp_')) {
+                state.token = val.trim();
+                localStorage.setItem('gitfast_token', state.token);
+                document.getElementById('settingsTokenInput').value = state.token;
+                fetchUserData();
+                fetchRepos();
+            }
+        }
+
+        function updateTokenFromSettings() {
+            const val = document.getElementById('settingsTokenInput').value.trim();
+            if (val.startsWith('ghp_')) {
+                saveToken(val);
+                alert("Token Updated Successfully");
+                closeSettings();
+            } else {
+                alert("Invalid Token format. Must start with ghp_");
+            }
+        }
+
+        function logout() {
+            localStorage.removeItem('gitfast_token');
+            location.reload();
+        }
+
+        // --- REPO HANDLING & CONTENT LOADING ---
+        function toggleRepoDropdown() {
+            const dd = document.getElementById('repoDropdown');
+            dd.classList.toggle('hidden');
+        }
+
+        function renderRepoList(filter = '') {
+            const list = document.getElementById('repoList');
+            const filtered = state.repos.filter(r => r.full_name.toLowerCase().includes(filter.toLowerCase()));
+            
+            if (filtered.length === 0 && !state.user) {
+                list.innerHTML = '<div class="p-4 text-center text-slate-500 text-xs italic">Connect token to load repos</div>';
+                return;
+            }
+
+            list.innerHTML = filtered.map(r => `
+                <div onclick="selectRepo('${r.full_name}')" class="p-3 border-b border-slate-800 hover:bg-slate-800 cursor-pointer transition-colors flex items-center justify-between group">
+                    <div>
+                        <div class="font-bold text-slate-300 text-xs group-hover:text-white">${r.name}</div>
+                        <div class="text-[10px] text-slate-500">${new Date(r.updated_at).toLocaleDateString()}</div>
+                    </div>
+                    ${r.has_pages ? '<i class="fas fa-globe text-green-500 text-xs" title="Pages Active"></i>' : ''}
+                </div>
+            `).join('');
+        }
+
+        function handleRepoInput(val) {
+            state.currentRepo = val;
+            renderRepoList(val);
+            if (val.length > 0) document.getElementById('repoDropdown').classList.remove('hidden');
+        }
+
+        async function selectRepo(name) {
+            state.currentRepo = name;
+            document.getElementById('repoNameInput').value = name;
+            document.getElementById('repoDropdown').classList.add('hidden');
+
+            // After a zip upload, picking a repo usually means "deploy my files there" — don't wipe them silently
+            if (state.importedZip) {
+                const keep = confirm(
+                    `Keep the files from ${state.importedZip} and deploy them to ${name}?\n\n` +
+                    `OK = keep my uploaded files\nCancel = replace them with the files already in ${name}`
+                );
+                if (keep) {
+                    setStatus(`Deploy target: ${name}`);
+                    return;
+                }
+            }
+            await loadRepoContent(name);
+        }
+
+        async function loadRepoContent(fullRepoName) {
+            // Show Loader
+            document.getElementById('fileLoader').classList.remove('hidden');
+            
+            const [owner, repo] = fullRepoName.includes('/') ? fullRepoName.split('/') : [state.user.login, fullRepoName];
+            const files = defaultWorkspace();
+            
+            // Parallel fetch
+            await Promise.all(DEFAULT_FILES.map(async (fileName) => {
+                try {
+                    const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${fileName}`, {
+                        headers: { 'Authorization': `token ${state.token}` }
+                    });
+                    
+                    if (res.ok) {
+                        const data = await res.json();
+                        // Handle UTF-8 decoding correctly
+                        const content = new TextDecoder().decode(base64ToBytes(data.content.replace(/\s/g, "")));
+                        files.set(fileName, makeTextFile(content, true));
+                    }
+                    // File not found -> stays as the empty default
+                } catch (e) {
+                    console.error(`Error loading ${fileName}`, e);
+                }
+            }));
+
+            // Update UI
+            state.files = files;
+            state.importedZip = null;
+            state.previewPath = null;
+            state.openFolders.clear();
+            renderTree();
+            openFile(files.has(state.currentPath) ? state.currentPath : 'index.html');
+            refreshPreview();
+            setStatus('Ready');
+            document.getElementById('fileLoader').classList.add('hidden');
+        }
+
+        // --- ZIP UPLOAD ---
+        const SKIP_DIRS = new Set(['node_modules', '.git', '__MACOSX', '__pycache__', '.venv']);
+        const SKIP_FILES = new Set(['.DS_Store', 'Thumbs.db', 'desktop.ini']);
+
+        function cleanZipPath(raw) {
+            const parts = raw.replace(/\\/g, '/').split('/').filter((p) => p && p !== '.');
+            if (!parts.length || parts.includes('..')) return null;
+            return parts.join('/');
+        }
+
+        function shouldSkipPath(path) {
+            const parts = path.split('/');
+            const name = parts.pop();
+            return SKIP_FILES.has(name) || name.startsWith('._') || parts.some((p) => SKIP_DIRS.has(p));
+        }
+
+        // "my-app/..." wrapper folder that most zips have -> strip it so files land at the repo root
+        function commonRootFolder(paths) {
+            const first = paths[0].split('/');
+            if (first.length < 2) return '';
+            const root = first[0] + '/';
+            return paths.every((p) => p.startsWith(root)) ? root : '';
+        }
+
+        function setZipBusy(busy) {
+            $('zipBtn').disabled = busy;
+            $('zipBtnIcon').className = busy ? 'fas fa-circle-notch fa-spin text-accent text-xs' : 'fas fa-upload text-accent text-xs';
+            $('zipBtnLabel').innerText = busy ? 'Unzipping...' : 'Upload ZIP';
+            $('fileLoader').classList.toggle('hidden', !busy);
+        }
+
+        async function handleZipUpload(input) {
+            const zipFile = input.files && input.files[0];
+            input.value = ''; // lets the same zip be picked again later
+            if (!zipFile) return;
+
+            if (typeof JSZip === 'undefined') {
+                alert("The unzip library didn't load. Check your connection, reload the page and try again.");
+                return;
+            }
+
+            setZipBusy(true);
+            setStatus(`Reading ${zipFile.name}...`);
+
+            try {
+                const zip = await JSZip.loadAsync(zipFile);
+
+                const entries = [];
+                let skipped = 0;
+                zip.forEach((relPath, entry) => {
+                    if (entry.dir) return;
+                    const path = cleanZipPath(relPath);
+                    if (!path || shouldSkipPath(path)) { skipped++; return; }
+                    entries.push({ path, entry });
+                });
+
+                if (!entries.length) throw new Error("There are no usable files in this zip.");
+
+                const root = commonRootFolder(entries.map((e) => e.path));
+                const files = new Map();
+
+                for (let i = 0; i < entries.length; i++) {
+                    const { path, entry } = entries[i];
+                    const bytes = await entry.async('uint8array');
+                    const exec = typeof entry.unixPermissions === 'number' && (entry.unixPermissions & 0o111) !== 0;
+                    files.set(path.slice(root.length), makeFile(path, bytes, { exec }));
+                    if (i % 20 === 0) setStatus(`Unzipping ${i + 1} / ${entries.length}...`);
+                }
+
+                // Swap the workspace over to the uploaded project
+                state.files = files;
+                state.importedZip = zipFile.name;
+                state.previewPath = null;
+                state.openFolders = new Set();
+
+                const start = pickPreviewEntry()
+                    || [...files.keys()].find((p) => /^readme(\.|$)/i.test(p))
+                    || [...files.keys()].sort(sortNames)[0];
+
+                if (files.size <= 40) {
+                    for (const p of files.keys()) expandAncestors(p);
+                } else {
+                    expandAncestors(start);
+                }
+
+                renderTree();
+                openFile(start);
+                refreshPreview();
+                setStatus(`${files.size} file${files.size === 1 ? '' : 's'} loaded from ${zipFile.name}` + (skipped ? ` · ${skipped} skipped` : ''));
+            } catch (e) {
+                console.error(e);
+                setStatus('Zip upload failed');
+                alert("Couldn't read that zip: " + e.message);
+            } finally {
+                setZipBusy(false);
+            }
+        }
+
+        // --- FILE EXPLORER ---
+        function buildTree() {
+            const root = { dirs: new Map(), files: [] };
+            for (const path of state.files.keys()) {
+                const parts = path.split('/');
+                let node = root;
+                for (let i = 0; i < parts.length - 1; i++) {
+                    if (!node.dirs.has(parts[i])) node.dirs.set(parts[i], { dirs: new Map(), files: [] });
+                    node = node.dirs.get(parts[i]);
+                }
+                node.files.push(path);
+            }
+            return root;
+        }
+
+        function renderTreeNode(node, prefix, depth) {
+            let out = '';
+            const indent = 8 + depth * 12;
+
+            for (const name of [...node.dirs.keys()].sort(sortNames)) {
+                const full = prefix + name;
+                const open = state.openFolders.has(full);
+                out += `
+                    <button type="button" class="tree-row" data-folder="${escapeHtml(full)}" style="padding-left:${indent}px" title="${escapeHtml(full)}">
+                        <i class="fas fa-chevron-right tree-chevron ${open ? 'open' : ''}"></i>
+                        <i class="fas ${open ? 'fa-folder-open' : 'fa-folder'} tree-icon text-sky-400/80"></i>
+                        <span class="tree-name">${escapeHtml(name)}</span>
+                    </button>`;
+                if (open) out += renderTreeNode(node.dirs.get(name), full + '/', depth + 1);
+            }
+
+            for (const path of node.files.sort((a, b) => sortNames(basename(a), basename(b)))) {
+                const meta = getFileType(path);
+                out += `
+                    <button type="button" class="tree-row ${path === state.currentPath ? 'active' : ''}" data-path="${escapeHtml(path)}" style="padding-left:${indent + 14}px" title="${escapeHtml(path)}">
+                        <i class="${meta.icon} ${meta.color} tree-icon"></i>
+                        <span class="tree-name">${escapeHtml(basename(path))}</span>
+                    </button>`;
+            }
+            return out;
+        }
+
+        function renderTree() {
+            $('fileTree').innerHTML = renderTreeNode(buildTree(), '', 0);
+            const n = state.files.size;
+            $('fileCount').innerText = `${n} file${n === 1 ? '' : 's'}`;
+            updateWorkspaceInfo();
+        }
+
+        function toggleFolder(folder) {
+            if (state.openFolders.has(folder)) state.openFolders.delete(folder);
+            else state.openFolders.add(folder);
+            renderTree();
+        }
+
+        function expandAncestors(path) {
+            const parts = path.split('/');
+            for (let i = 1; i < parts.length; i++) state.openFolders.add(parts.slice(0, i).join('/'));
+        }
+
+        const isDeployable = (file) => !(file.placeholder && file.content === '');
+        const fileSize = (file) => file.binary ? file.size : file.content.length;
+
+        function updateWorkspaceInfo() {
+            const list = [...state.files.values()].filter(isDeployable);
+            const bytes = list.reduce((sum, f) => sum + fileSize(f), 0);
+            $('workspaceInfo').innerText = list.length
+                ? `${list.length} file${list.length === 1 ? '' : 's'} (${formatBytes(bytes)}) will be deployed`
+                : 'Nothing to deploy yet';
+        }
+
+        // --- EDITOR LOGIC ---
+        function openFile(path) {
+            const file = state.files.get(path);
+            if (!file) return;
+            state.currentPath = path;
+
+            const editor = $('mainEditor');
+            const binaryView = $('binaryView');
+            const meta = getFileType(path);
+
+            if (file.binary) {
+                editor.classList.add('hidden');
+                binaryView.classList.remove('hidden');
+                binaryView.classList.add('flex');
+
+                const mime = MIME_TYPES[extname(path)] || '';
+                const img = $('binaryImg');
+                const isImage = mime.startsWith('image/');
+                img.classList.toggle('hidden', !isImage);
+                $('binaryIcon').classList.toggle('hidden', isImage);
+                if (isImage) img.src = `data:${mime};base64,${file.content}`;
+                else { img.removeAttribute('src'); $('binaryIcon').className = `${meta.icon} text-4xl text-slate-600`; }
+
+                $('binaryName').innerText = basename(path);
+                $('binaryMeta').innerText = `${meta.label} · ${formatBytes(file.size)} · can't be edited here, deploys exactly as uploaded`;
+            } else {
+                binaryView.classList.add('hidden');
+                binaryView.classList.remove('flex');
+                editor.classList.remove('hidden');
+                editor.value = file.content;
+                editor.scrollTop = 0;
+            }
+
+            $('fileName').innerText = path;
+            $('fileName').title = path;
+            $('fileIcon').className = `${meta.icon} ${meta.color}`;
+            $('fileType').innerText = meta.label;
+
+            // Move the highlight without rebuilding the whole tree
+            document.querySelectorAll('#fileTree .tree-row.active').forEach((el) => el.classList.remove('active'));
+            for (const row of document.querySelectorAll('#fileTree .tree-row[data-path]')) {
+                if (row.dataset.path === path) { row.classList.add('active'); break; }
+            }
+
+            // Opening another HTML page points the preview at it
+            if (!file.binary && /\.html?$/i.test(path) && state.previewPath !== path) {
+                const before = pickPreviewEntry();
+                state.previewPath = path;
+                if (before !== path && state.previewActive) refreshPreview();
+            }
+        }
+
+        function handleInput() {
+            const file = state.files.get(state.currentPath);
+            if (!file || file.binary) return;
+
+            const value = $('mainEditor').value;
+            file.content = file.crlf ? value.replace(/\n/g, '\r\n') : value;
+
+            clearTimeout(window.previewTimer);
+            window.previewTimer = setTimeout(() => {
+                updateWorkspaceInfo();
+                if (state.previewActive) refreshPreview();
+            }, 800);
+        }
+
+        // --- PREVIEW LOGIC ---
+        function togglePreview() {
+            const panel = document.getElementById('previewPanel');
+            state.previewActive = !state.previewActive;
+            if (state.previewActive) {
+                panel.classList.remove('hidden');
+                $('splitHandle').classList.remove('hidden');
+                refreshPreview();
+            } else {
+                panel.classList.add('hidden');
+                $('splitHandle').classList.add('hidden');
+            }
+        }
+
+        // Which HTML file the preview shows: the last one opened, else the shallowest index.html
+        function pickPreviewEntry() {
+            if (state.previewPath && state.files.has(state.previewPath)) return state.previewPath;
+            const pages = [...state.files.keys()].filter((p) => /\.html?$/i.test(p) && !state.files.get(p).binary);
+            if (!pages.length) return null;
+            const score = (p) => (/(^|\/)index\.html?$/i.test(p) ? 0 : 100) + p.split('/').length;
+            return pages.sort((a, b) => score(a) - score(b) || sortNames(a, b))[0];
+        }
+
+        // Maps a src/href found in the project to a file in the workspace (or null for external URLs)
+        function resolveRef(baseDir, ref) {
+            if (!ref) return null;
+            ref = ref.trim();
+            if (!ref || /^(?:[a-z][a-z0-9+.-]*:|\/\/|#)/i.test(ref)) return null;
+            ref = ref.split('#')[0].split('?')[0].replace(/^%PUBLIC_URL%/, '');
+            try { ref = decodeURIComponent(ref); } catch (e) { /* keep as written */ }
+
+            const absolute = ref.startsWith('/');
+            const tryFrom = (dir) => {
+                const out = dir ? dir.split('/').filter(Boolean) : [];
+                for (const part of ref.split('/')) {
+                    if (!part || part === '.') continue;
+                    if (part === '..') { if (!out.length) return null; out.pop(); }
+                    else out.push(part);
+                }
+                const path = out.join('/');
+                return state.files.has(path) ? path : null;
+            };
+
+            // "/x.css" means the site root: the entry page's folder first, then the project root
+            return tryFrom(baseDir) || (absolute && baseDir ? tryFrom('') : null);
+        }
+
+        function toDataUri(path, file) {
+            const mime = MIME_TYPES[extname(path)] || (file.binary ? 'application/octet-stream' : 'text/plain');
+            return `data:${mime};base64,${file.binary ? file.content : textToBase64(file.content)}`;
+        }
+
+        function inlineCssUrls(css, baseDir) {
+            return css.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, (match, quote, ref) => {
+                const path = resolveRef(baseDir, ref);
+                return path ? `url("${toDataUri(path, state.files.get(path))}")` : match;
+            });
+        }
+
+        const escapeScript = (js) => js.replace(/<\/script/gi, '<\\/script');
+
+        // Builds one self-contained page: local stylesheets, scripts and images are pulled in from the workspace
+        function buildPreview() {
+            const entry = pickPreviewEntry();
+            if (!entry) {
+                return {
+                    entry: null,
+                    needsBuild: false,
+                    html: '<!DOCTYPE html><html><body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;font:14px system-ui,sans-serif;color:#64748b;text-align:center;padding:24px;box-sizing:border-box">This project has no HTML file to preview.</body></html>'
+                };
+            }
+
+            const dom = new DOMParser().parseFromString(state.files.get(entry).content, 'text/html');
+            const baseDir = dirname(entry);
+            const inlined = new Set();
+            let needsBuild = false;
+
+            const lookup = (ref) => {
+                const path = resolveRef(baseDir, ref);
+                return path ? { path, file: state.files.get(path) } : null;
+            };
+
+            dom.querySelectorAll('style').forEach((style) => {
+                style.textContent = inlineCssUrls(style.textContent, baseDir);
+            });
+
+            dom.querySelectorAll('link[href]').forEach((link) => {
+                const hit = lookup(link.getAttribute('href'));
+                if (!hit) return;
+                const rel = (link.getAttribute('rel') || '').toLowerCase();
+                if (rel.includes('stylesheet') && !hit.file.binary) {
+                    const style = dom.createElement('style');
+                    if (link.getAttribute('media')) style.setAttribute('media', link.getAttribute('media'));
+                    style.textContent = inlineCssUrls(hit.file.content, dirname(hit.path));
+                    link.replaceWith(style);
+                    inlined.add(hit.path);
+                } else if (rel.includes('icon')) {
+                    link.setAttribute('href', toDataUri(hit.path, hit.file));
+                }
+            });
+
+            dom.querySelectorAll('script[src]').forEach((script) => {
+                const hit = lookup(script.getAttribute('src'));
+                if (!hit || hit.file.binary) return;
+                if (/\.(jsx|tsx?|vue|svelte)$/i.test(hit.path)) { needsBuild = true; return; }
+                script.removeAttribute('src');
+                script.textContent = escapeScript(hit.file.content);
+                inlined.add(hit.path);
+            });
+
+            dom.querySelectorAll('img[src], source[src], video[src], audio[src]').forEach((el) => {
+                const hit = lookup(el.getAttribute('src'));
+                if (hit) el.setAttribute('src', toDataUri(hit.path, hit.file));
+            });
+
+            // Same behaviour as before: style.css / script.js next to the page apply even if the page doesn't link them
+            const css = state.files.get(baseDir + 'style.css');
+            if (css && !css.binary && css.content && !inlined.has(baseDir + 'style.css')) {
+                const style = dom.createElement('style');
+                style.textContent = inlineCssUrls(css.content, baseDir);
+                dom.head.appendChild(style);
+            }
+            const js = state.files.get(baseDir + 'script.js');
+            if (js && !js.binary && js.content && !inlined.has(baseDir + 'script.js')) {
+                const script = dom.createElement('script');
+                script.textContent = escapeScript(`try { ${js.content} } catch(e) { console.error(e); }`);
+                dom.body.appendChild(script);
+            }
+
+            return { entry, needsBuild, html: '<!DOCTYPE html>\n' + dom.documentElement.outerHTML };
+        }
+
+        function refreshPreview() {
+            const { entry, needsBuild, html } = buildPreview();
+            document.getElementById('previewFrame').srcdoc = html;
+
+            const label = $('previewEntry');
+            label.innerText = !entry ? '' : needsBuild ? `${entry} — needs a build step, may show blank` : entry;
+            label.className = `font-mono font-medium normal-case tracking-normal truncate ${needsBuild ? 'text-amber-600' : 'text-slate-400'}`;
+            label.title = label.innerText;
+        }
+
+        // The "show site" button: opens the current preview full-size in its own tab
+        function openPreviewInTab() {
+            const { entry, html } = buildPreview();
+            if (!entry) {
+                alert("This project has no HTML file to show.");
+                return;
+            }
+            if (state.previewBlobUrl) URL.revokeObjectURL(state.previewBlobUrl);
+            state.previewBlobUrl = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
+            const win = window.open(state.previewBlobUrl, '_blank');
+            if (!win) alert("Your browser blocked the new tab. Allow pop-ups for this page and try again.");
+        }
+
+        // --- RESIZABLE SPLIT (code <-> preview) ---
+        function initSplitter() {
+            const handle = $('splitHandle');
+            const panel = $('previewPanel');
+            const main = $('workspace');
+            const MIN_PREVIEW = 280;
+            const MIN_EDITOR = 320;
+            let grabOffset = 0;
+            let dragging = false;
+
+            try {
+                const saved = localStorage.getItem('gitfast_preview_width');
+                if (saved && /^\d+(\.\d+)?%$/.test(saved)) panel.style.width = saved;
+            } catch (e) { /* storage unavailable: keep the default */ }
+
+            handle.addEventListener('pointerdown', (e) => {
+                if (e.button !== 0) return;
+                e.preventDefault();
+                dragging = true;
+                grabOffset = handle.getBoundingClientRect().right - e.clientX;
+                handle.setPointerCapture(e.pointerId);
+                handle.classList.add('dragging');
+                document.body.classList.add('resizing');
+            });
+
+            handle.addEventListener('pointermove', (e) => {
+                if (!dragging) return;
+                const rect = main.getBoundingClientRect();
+                const maxWidth = Math.max(MIN_PREVIEW, rect.width - $('sidebar').offsetWidth - handle.offsetWidth - MIN_EDITOR);
+                const wanted = rect.right - e.clientX - grabOffset;
+                const width = Math.min(Math.max(wanted, MIN_PREVIEW), maxWidth);
+                panel.style.width = ((width / rect.width) * 100).toFixed(2) + '%';
+            });
+
+            const stop = () => {
+                if (!dragging) return;
+                dragging = false;
+                handle.classList.remove('dragging');
+                document.body.classList.remove('resizing');
+                try { localStorage.setItem('gitfast_preview_width', panel.style.width); } catch (e) { /* ignore */ }
+            };
+            handle.addEventListener('pointerup', stop);
+            handle.addEventListener('pointercancel', stop);
+            handle.addEventListener('lostpointercapture', stop);
+
+            handle.addEventListener('dblclick', () => {
+                panel.style.width = '45%';
+                try { localStorage.removeItem('gitfast_preview_width'); } catch (e) { /* ignore */ }
+            });
+        }
+
+        // --- SETTINGS LOGIC ---
+        function openSettings() {
+            // Handle Guest State in Modal
+            if (!state.user) {
+                document.getElementById('settingsAvatar').src = 'https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png';
+                document.getElementById('settingsName').innerText = 'Guest User';
+            }
+            document.getElementById('settingsModal').classList.remove('hidden');
+        }
+
+        function closeSettings() {
+            document.getElementById('settingsModal').classList.add('hidden');
+        }
+
+        // --- GITHUB API ---
+        function ghFetch(path, { method = 'GET', body } = {}) {
+            const headers = { 'Authorization': `token ${state.token}`, 'Accept': 'application/vnd.github+json' };
+            if (body) headers['Content-Type'] = 'application/json';
+            return fetch(`https://api.github.com${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined });
+        }
+
+        // Like ghFetch, but returns the JSON, retries when GitHub asks us to slow down, and throws a readable error
+        async function ghJson(path, opts, label) {
+            for (let attempt = 0; ; attempt++) {
+                const res = await ghFetch(path, opts);
+                if (res.ok) return res.json();
+
+                const retryAfter = Number(res.headers.get('retry-after'));
+                const retryable = res.status === 429 || res.status >= 500 || (res.status === 403 && retryAfter > 0);
+                if (retryable && attempt < 2) {
+                    await new Promise((r) => setTimeout(r, Math.min(retryAfter > 0 ? retryAfter * 1000 : 2000 * (attempt + 1), 30000)));
+                    continue;
+                }
+
+                let detail = '';
+                try { detail = (await res.json()).message || ''; } catch (e) { /* no JSON body */ }
+                throw new Error(`${label || path} failed (${res.status})${detail ? ': ' + detail : ''}`);
+            }
+        }
+
+        const encodePath = (path) => path.split('/').map(encodeURIComponent).join('/');
+        const fileToBase64 = (file) => file.binary ? file.content : textToBase64(file.content);
+
+        // All files in ONE commit: upload blobs, build a tree on top of the current one, commit, move the branch
+        async function deployAsSingleCommit(owner, repo, branch, headSha, list, message, onProgress) {
+            const base = `/repos/${owner}/${repo}`;
+            const headCommit = await ghJson(`${base}/git/commits/${headSha}`, {}, 'Reading latest commit');
+
+            const tree = new Array(list.length);
+            let next = 0, done = 0, failed = false;
+            const worker = async () => {
+                while (!failed && next < list.length) {
+                    const i = next++;
+                    const [path, file] = list[i];
+                    try {
+                        const blob = await ghJson(`${base}/git/blobs`, {
+                            method: 'POST',
+                            body: { content: fileToBase64(file), encoding: 'base64' }
+                        }, `Uploading ${path}`);
+                        tree[i] = { path, mode: file.exec ? '100755' : '100644', type: 'blob', sha: blob.sha };
+                    } catch (e) {
+                        failed = true;
+                        throw e;
+                    }
+                    onProgress(++done, list.length, path);
+                }
+            };
+            await Promise.all(Array.from({ length: Math.min(3, list.length) }, worker));
+
+            const newTree = await ghJson(`${base}/git/trees`, {
+                method: 'POST',
+                body: { base_tree: headCommit.tree.sha, tree }
+            }, 'Building file tree');
+            if (newTree.sha === headCommit.tree.sha) return false; // nothing changed
+
+            const commit = await ghJson(`${base}/git/commits`, {
+                method: 'POST',
+                body: { message, tree: newTree.sha, parents: [headSha] }
+            }, 'Creating commit');
+
+            await ghJson(`${base}/git/refs/heads/${branch}`, {
+                method: 'PATCH',
+                body: { sha: commit.sha }
+            }, `Updating ${branch}`);
+            return true;
+        }
+
+        // Fallback for a repo with no commits yet (the single-commit route needs an existing branch)
+        async function deployFileByFile(owner, repo, list, message, onProgress) {
+            let done = 0;
+            for (const [path, file] of list) {
+                const url = `/repos/${owner}/${repo}/contents/${encodePath(path)}`;
+                const body = { message, content: fileToBase64(file) };
+                const existing = await ghFetch(url);
+                if (existing.ok) body.sha = (await existing.json()).sha;
+                await ghJson(url, { method: 'PUT', body }, `Uploading ${path}`);
+                onProgress(++done, list.length, path);
+            }
+        }
+
+        // --- DEPLOYMENT LOGIC ---
+        // .env, .env.local, .env.production ... but not .env.example / .env.sample / .env.template
+        const SECRET_FILE = /(^|\/)\.env(\.(?!(example|sample|template|dist)$)[^\/]*)?$/i;
+
+        async function deploy() {
+            if (!state.token || !state.currentRepo) {
+                alert("Please enter a GitHub Token and Repository Name.");
+                return;
+            }
+
+            let list = [...state.files].filter(([, file]) => isDeployable(file));
+            if (!list.length) {
+                alert("There's nothing to deploy yet. Add some code or upload a zip first.");
+                return;
+            }
+
+            const secrets = list.filter(([path]) => SECRET_FILE.test(path)).map(([path]) => path);
+            if (secrets.length) {
+                const leaveOut = confirm(
+                    `This project contains ${secrets.join(', ')}.\n` +
+                    `These files usually hold passwords and API keys, and anyone can read them if the repo is public.\n\n` +
+                    `OK = deploy without them (recommended)\nCancel = upload them too`
+                );
+                if (leaveOut) list = list.filter(([path]) => !SECRET_FILE.test(path));
+                if (!list.length) return;
+            }
+
+            // The progress and success screens live in the preview panel, so make sure it's showing
+            if (!state.previewActive) togglePreview();
+
+            const btn = document.getElementById('deployBtn');
+            const loader = document.getElementById('loadingOverlay');
+            const progressBar = document.getElementById('progressBar');
+            const stepText = document.getElementById('loadingStep');
+            
+            btn.disabled = true;
+            loader.classList.remove('hidden');
+            
+            try {
+                // 1. Check/Create Repo
+                stepText.innerText = "Checking Repository...";
+                progressBar.style.width = "10%";
+
+                if (!state.currentRepo.includes('/') && !state.user) {
+                    throw new Error("Couldn't read your GitHub account. Check the token, or enter the repo as username/repo-name.");
+                }
+                let [owner, repoName] = state.currentRepo.includes('/') ? state.currentRepo.split('/') : [state.user.login, state.currentRepo];
+                
+                let repoRes = await ghFetch(`/repos/${owner}/${repoName}`);
+                let repoInfo;
+                
+                if (repoRes.status === 404) {
+                    stepText.innerText = "Creating Repository...";
+                    repoInfo = await ghJson('/user/repos', {
+                        method: 'POST',
+                        body: { name: repoName, auto_init: true, description: "Created with GitFast Ultra" }
+                    }, 'Creating repository');
+                    owner = repoInfo.owner.login;
+                    await new Promise(r => setTimeout(r, 2000));
+                } else if (repoRes.ok) {
+                    repoInfo = await repoRes.json();
+                } else {
+                    throw new Error(`Couldn't open ${owner}/${repoName} (${repoRes.status}). Check the token's permissions.`);
+                }
+
+                const branch = repoInfo.default_branch || 'main';
+
+                // 2. Upload Files
+                const message = `Deploy ${list.length} file${list.length === 1 ? '' : 's'} via GitFast Ultra`;
+                const onProgress = (done, total, path) => {
+                    stepText.innerText = `Uploaded ${done} / ${total} · ${path}`;
+                    progressBar.style.width = `${20 + (done / total) * 60}%`;
+                };
+
+                stepText.innerText = `Uploading ${list.length} file${list.length === 1 ? '' : 's'}...`;
+                progressBar.style.width = "20%";
+
+                let changed = true;
+                const refRes = await ghFetch(`/repos/${owner}/${repoName}/git/ref/heads/${branch}`);
+                if (refRes.ok) {
+                    const headSha = (await refRes.json()).object.sha;
+                    changed = await deployAsSingleCommit(owner, repoName, branch, headSha, list, message, onProgress);
+                } else {
+                    await deployFileByFile(owner, repoName, list, message, onProgress);
+                }
+
+                // 3. Enable Pages
+                stepText.innerText = "Enabling GitHub Pages...";
+                progressBar.style.width = "90%";
+                await ghFetch(`/repos/${owner}/${repoName}/pages`, {
+                    method: 'POST',
+                    body: { source: { branch, path: '/' } }
+                }).catch(e => console.log("Pages might already be active"));
+
+                progressBar.style.width = "100%";
+
+                if (!changed) {
+                    stepText.innerText = "Already up to date — nothing new to deploy.";
+                    setStatus('Already up to date');
+                    setTimeout(() => loader.classList.add('hidden'), 1800);
+                    return;
+                }
+
+                stepText.innerText = "Done!";
+                setStatus(`Deployed to ${owner}/${repoName}`);
+                
+                setTimeout(() => {
+                    loader.classList.add('hidden');
+                    const url = `https://${owner}.github.io/${repoName}/`;
+                    
+                    // --- TIMER LOGIC ---
+                    const overlay = document.getElementById('deployOverlay');
+                    const timerDisplay = document.getElementById('deployTimer');
+                    const visitBtn = document.getElementById('liveLink');
+                    const propMsg = document.getElementById('propagationMessage');
+
+                    visitBtn.href = url;
+                    visitBtn.classList.add('opacity-50', 'pointer-events-none', 'grayscale');
+                    visitBtn.innerHTML = '<i class="fas fa-clock animate-spin"></i> Wait 30s...';
+                    propMsg.innerText = "Waiting for GitHub to propagate changes to avoid 404 errors.";
+                    overlay.classList.remove('hidden');
+
+                    let timeLeft = 30;
+                    timerDisplay.innerText = timeLeft;
+
+                    if (window.deployInterval) clearInterval(window.deployInterval);
+
+                    window.deployInterval = setInterval(() => {
+                        timeLeft--;
+                        timerDisplay.innerText = timeLeft;
+                        visitBtn.innerHTML = `<i class="fas fa-clock animate-spin"></i> Wait ${timeLeft}s...`;
+
+                        if (timeLeft <= 0) {
+                            clearInterval(window.deployInterval);
+                            visitBtn.classList.remove('opacity-50', 'pointer-events-none', 'grayscale');
+                            visitBtn.innerHTML = '<i class="fas fa-external-link-alt"></i> Visit Live Site';
+                            propMsg.innerText = "Propagation complete! Your site should be live now.";
+                            
+                            if (Notification.permission === "granted") {
+                                new Notification("Deployment Ready 🚀", {
+                                    body: `Your site ${repoName} is now live!`,
+                                    icon: "https://github.githubassets.com/favicons/favicon.png"
+                                });
+                            }
+                        }
+                    }, 1000);
+
+                }, 500);
+
+            } catch (e) {
+                alert("Error: " + e.message);
+                loader.classList.add('hidden');
+                setStatus('Deploy failed');
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        function closeOverlay() {
+            document.getElementById('deployOverlay').classList.add('hidden');
+            if (window.deployInterval) clearInterval(window.deployInterval);
+        }
+
+    </script>
+</body>
+</html>
